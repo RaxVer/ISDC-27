@@ -1,0 +1,15 @@
+# Virtual Environments
+.venv
+venv/
+env/
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large auto-downloaded YOLO weights (auto-fetched on first run of pipeline.py)
+models/yolov8n.onnx
+*.pt
+*.mp4
+*.avi
