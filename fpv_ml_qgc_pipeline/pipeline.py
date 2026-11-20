@@ -248,7 +248,8 @@ def main() -> int:
                 sample_saved = True
 
             if args.preview:
-                cv2.imshow("FPV ML Pipeline -> QGroundControl (Keys: e=Mode y=YOLO s=Shape c=Color v=Split q=Quit)", output_frame)
+                disp = cv2.resize(output_frame, (960, 540), interpolation=cv2.INTER_NEAREST) if output_frame.shape[1] > 960 else output_frame
+                cv2.imshow("FPV ML Preview (1080p60 -> QGC) [e=Mode y=YOLO c=Anomaly v=Split q=Quit]", disp)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
                     break
