@@ -152,6 +152,8 @@ class QGCStreamer:
                 "-an",
                 "-c:v",
                 "libx264",
+                "-threads",
+                "6",
                 "-preset",
                 "ultrafast",
                 "-tune",
@@ -167,11 +169,11 @@ class QGCStreamer:
                 "-pix_fmt",
                 "yuv420p",
                 "-g",
-                "15",
+                "30",
                 "-flush_packets",
                 "1",
                 "-x264-params",
-                "repeat-headers=1:keyint=15:min-keyint=15:scenecut=0:bframes=0:sliced-threads=1:rc-lookahead=0:sync-lookahead=0",
+                "repeat-headers=1:keyint=30:min-keyint=30:scenecut=0:bframes=0:sliced-threads=1:rc-lookahead=0:sync-lookahead=0",
             ])
             if self.stream_format == "mpegts":
                 cmd.extend([

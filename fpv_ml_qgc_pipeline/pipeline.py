@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         choices=["cnn_rnn", "fast_hybrid", "passthrough"],
         help="Enhancement engine mode: 'cnn_rnn' (ESPCN + Temporal RNN), 'fast_hybrid', or 'passthrough'",
     )
-    parser.add_argument("--fps", type=int, default=30, help="Target output stream framerate (default: 30)")
+    parser.add_argument("--fps", type=int, default=60, help="Target output stream framerate (default: 60)")
     parser.add_argument("--udp-host", type=str, default="127.0.0.1", help="Target QGroundControl IP (default: 127.0.0.1)")
     parser.add_argument("--udp-port", type=int, default=5600, help="Target QGroundControl UDP Video Port (default: 5600)")
     parser.add_argument(
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         choices=["rtp", "mpegts"],
         help="QGC stream protocol: 'rtp' (QGC 'UDP h.264 Video Stream') or 'mpegts' (QGC 'MPEG-TS (h.264)')",
     )
-    parser.add_argument("--bitrate", type=int, default=4000, help="H.264 stream bitrate in kbps (default: 4000)")
+    parser.add_argument("--bitrate", type=int, default=5500, help="H.264 stream bitrate in kbps (default: 5500)")
     parser.add_argument("--no-yolo", action="store_true", help="Disable YOLOv8n object detection")
     parser.add_argument("--no-shapes", action="store_true", help="Disable geometric shape & landing pad detection")
     parser.add_argument("--no-anomaly", action="store_true", help="Disable spectral color abnormality detection")
