@@ -1,15 +1,16 @@
 """
-Robust Temporally-Stabilized Generic Anomaly & Object-Presence Detector (`FPVDetector`).
+Martian-Terrain Foreign Object & Tool/Sensor Anomaly Detector (`FPVDetector`).
 
-Designed for Aerial FPV Drone feeds:
-- Does NOT output noisy/wrong class labels (e.g., 'BIRD', 'SPORTS BALL', 'SQUARE').
-- Detects ANY distinct foreground object or visual anomaly standing out from the terrain/ground
-  (luminance contrast + CIE LAB color saliency + optional label-free YOLOv8n proposals).
-- Runs a Persistent Temporal Tracker (`_AnomalyTracker`) with:
-  * Refresh throttling (detects every ~4 frames -> ~15 Hz, rendering smoothly at 60 FPS)
-  * Hysteresis confirmation (`min_hits=2`) to ignore single-frame RF static glitches
-  * Long retention (`hold_frames=24`, ~0.4s) so boxes NEVER flicker in and out
-  * EMA coordinate smoothing (`alpha=0.28`) so boxes glide steadily on targets
+Specifically tuned for aerial drone feeds over rocky / sandy / Martian-like terrain:
+- Rejects natural rocks, gravel, shadows, and floor seams using Robust Median/MAD
+  Terrain Normalization.
+- Detects man-made tools, sensors, metallic/painted equipment, and foreign objects
+  using a fused 3-signal anomaly score:
+    1. Chromaticity Outlier (CIE LAB Mahalanobis distance from dominant terrain color)
+    2. Specular / Saturation Foreign Material Signature (painted/plastic/anodized tools)
+    3. Sharp Man-Made Edge & Local Structural Contrast Density (Sobel gradient energy)
+- Fast temporal retention (`hold_frames=6`, ~0.1s): bridges single-frame flicker without
+  leaving ghost boxes behind when the camera pans away.
 """
 
 import threading
@@ -30,11 +31,11 @@ YOLO_ONNX_URLS = [
 
 @dataclass
 class Detection:
-    category: str          # 'anomaly'
-    label: str             # e.g. 'TARGET #1'
-    confidence: float      # [0.0, 1.0]
-    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
-    center: Tuple[int, int]          # (cx, cy)
+    category: str
+    label: str
+    confidence: float
+    bbox: Tuple[int, int, int, int]
+    center: Tuple[int, int]
     offset_from_center: Tuple[int, int]
     color_bgr: Tuple[int, int, int]
 
@@ -42,7 +43,7 @@ class Detection:
 @dataclass
 class _Track:
     track_id: int
-    bbox: np.ndarray       # float32 [x1, y1, x2, y2]
+    bbox: np.ndarray
     confidence: float
     hits: int
     misses: int
@@ -63,18 +64,22 @@ def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
 
 class _AnomalyTracker:
     """
-    Persistent Temporal Box Tracker with Hysteresis & EMA Smoothing.
-    Retains confirmed anomaly boxes across missed frames so detections stay rock-solid.
+    Fast-response Temporal Box Tracker:
+    - Confirms after 2 consistent detections (`min_hits=2`)
+    - Retains briefly (`max_age=6`, ~0.1s) so boxes don't flicker, but vanish immediately
+      when the object leaves the camera frame.
     """
 
-    def __init__(self, min_hits: int = 2, max_age: int = 24, ema_alpha: float = 0.28):
+    def __init__(self, min_hits: int = 2, max_age: int = 6, ema_alpha: float = 0.40):
         self.min_hits = min_hits
         self.max_age = max_age
         self.ema_alpha = ema_alpha
         self.next_id = 1
         self.tracks: List[_Track] = []
 
-    def update(self, raw_boxes: List[Tuple[Tuple[int, int, int, int], float]], frame_w: int, frame_h: int) -> List[Detection]:
+    def update(
+        self, raw_boxes: List[Tuple[Tuple[int, int, int, int], float]], frame_w: int, frame_h: int
+    ) -> List[Detection]:
         det_arrs = [np.array(b, dtype=np.float32) for b, _ in raw_boxes]
         det_confs = [c for _, c in raw_boxes]
         matched_dets = set()
@@ -92,8 +97,7 @@ class _AnomalyTracker:
                 dcx = 0.5 * (db[0] + db[2])
                 dcy = 0.5 * (db[1] + db[3])
                 dist = ((tcx - dcx) ** 2 + (tcy - dcy) ** 2) ** 0.5
-                # Match by IoU OR close centroid proximity (handles moving drone camera)
-                if iou >= 0.15 or dist <= max(45.0, frame_w * 0.045):
+                if iou >= 0.15 or dist <= max(45.0, frame_w * 0.04):
                     score = iou + max(0.0, 1.0 - dist / 150.0) * 0.5
                     if score > best_score:
                         best_score = score
@@ -109,7 +113,6 @@ class _AnomalyTracker:
             else:
                 trk.misses += 1
 
-        # Create new candidate tracks for unmatched detections
         for i, db in enumerate(det_arrs):
             if i not in matched_dets:
                 self.tracks.append(
@@ -125,10 +128,8 @@ class _AnomalyTracker:
                 if self.next_id > 99:
                     self.next_id = 1
 
-        # Keep tracks that haven't exceeded retention window
         self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
 
-        # Return only confirmed tracks (hits >= min_hits)
         frame_cx, frame_cy = frame_w // 2, frame_h // 2
         confirmed: List[Detection] = []
         for trk in self.tracks:
@@ -142,7 +143,7 @@ class _AnomalyTracker:
                 confirmed.append(
                     Detection(
                         category="anomaly",
-                        label=f"ANOMALY #{trk.track_id}",
+                        label=f"OBJECT #{trk.track_id}",
                         confidence=float(trk.confidence),
                         bbox=(x1, y1, x2, y2),
                         center=(cx, cy),
@@ -153,7 +154,6 @@ class _AnomalyTracker:
         return confirmed
 
     def get_retained(self, frame_w: int, frame_h: int) -> List[Detection]:
-        """Returns currently retained confirmed tracks without decaying misses (used on skipped frames)."""
         frame_cx, frame_cy = frame_w // 2, frame_h // 2
         confirmed: List[Detection] = []
         for trk in self.tracks:
@@ -163,7 +163,7 @@ class _AnomalyTracker:
                 confirmed.append(
                     Detection(
                         category="anomaly",
-                        label=f"ANOMALY #{trk.track_id}",
+                        label=f"OBJECT #{trk.track_id}",
                         confidence=float(trk.confidence),
                         bbox=(x1, y1, x2, y2),
                         center=(cx, cy),
@@ -177,15 +177,15 @@ class _AnomalyTracker:
 class FPVDetector:
     def __init__(
         self,
-        enable_yolo: bool = True,
+        enable_yolo: bool = False,
         enable_shapes: bool = False,
         enable_color_anomaly: bool = True,
-        yolo_conf_thresh: float = 0.28,
+        yolo_conf_thresh: float = 0.35,
         yolo_iou_thresh: float = 0.45,
         yolo_input_size: int = 416,
-        anomaly_z_thresh: float = 2.8,
-        detect_every_n: int = 4,
-        hold_frames: int = 24,
+        anomaly_z_thresh: float = 4.0,
+        detect_every_n: int = 2,
+        hold_frames: int = 6,
     ):
         self.enable_yolo = enable_yolo
         self.enable_shapes = enable_shapes
@@ -197,12 +197,12 @@ class FPVDetector:
         self.detect_every_n = max(1, int(detect_every_n))
         self.frame_counter = 0
 
-        self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.28)
+        self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.40)
 
         self.yolo_session = None
         self.yolo_input_name = None
         self.yolo_model_hw = (640, 640)
-        self.yolo_status = "DISABLED"
+        self.yolo_status = "Terrain-Anomaly (No-COCO)"
 
         self._yolo_lock = threading.Lock()
         self._yolo_pending_frame: Optional[np.ndarray] = None
@@ -256,14 +256,11 @@ class FPVDetector:
                 else:
                     self.yolo_model_hw = (self.yolo_input_size, self.yolo_input_size)
                 prov_short = providers[0].replace("ExecutionProvider", "")
-                self.yolo_status = f"Generic-Anomaly + YOLOv8n-Box ({prov_short}-Async)"
+                self.yolo_status = f"Terrain-Anomaly + YOLOv8n ({prov_short}-Async)"
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
             except Exception:
                 self.yolo_session = None
-                self.yolo_status = "Generic-Anomaly (Saliency)"
-        else:
-            self.yolo_status = "Generic-Anomaly (Saliency)"
 
     def _yolo_worker_loop(self) -> None:
         while self._yolo_running:
@@ -280,7 +277,6 @@ class FPVDetector:
                 self._latest_yolo_boxes = boxes
 
     def _detect_yolo_boxes(self, frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
-        """Extracts label-free bounding box proposals from YOLOv8n (640x360 input)."""
         if self.yolo_session is None:
             return []
 
@@ -334,20 +330,17 @@ class FPVDetector:
             bx, by, b_w, b_h = nms_boxes[idx]
             ix1, iy1 = int(max(0, bx)), int(max(0, by))
             ix2, iy2 = int(min(w - 1, bx + b_w)), int(min(h - 1, by + b_h))
-            # Ignore huge full-frame false boxes or edge-hugging drone legs
             area_frac = ((ix2 - ix1) * (iy2 - iy1)) / float(w * h)
             if area_frac > 0.25 or area_frac < 0.0008:
                 continue
             proposals.append(((ix1, iy1, ix2, iy2), float(max_scores[idx])))
         return proposals
 
-    def _detect_foreground_anomalies(self, frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
+    def _detect_terrain_anomalies(self, frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
         """
-        Generic Background-Contrast Foreground Anomaly Detector (< 1.5 ms):
-        Finds ANY object/anomaly that stands out from the surrounding terrain/floor in EITHER:
-          - Local luminance contrast (dark screws, bright white markers, debris, pads)
-          - Chromaticity / color deviation (CIE LAB Z-score outlier)
-        Automatically ignores border-touching drone landing gear / frame struts and thin floor seams.
+        Martian-Terrain Foreign-Object & Tool/Sensor Detector (< 1.8 ms):
+        Uses Robust Median + MAD Terrain Normalization so natural rocky/sandy ground
+        is ignored while man-made tools, sensors, and distinct foreign objects pop out.
         """
         h, w = frame.shape[:2]
         det_w, det_h = 320, 180
@@ -359,41 +352,53 @@ class FPVDetector:
         A = lab[:, :, 1]
         B = lab[:, :, 2]
 
-        # Local background estimation via wide Gaussian blur (isolates objects from gradual lighting)
-        bg_L = cv2.GaussianBlur(L, (31, 31), 9.0)
+        # 1. Robust Terrain Color Baseline (Median + MAD ignores outlier objects when estimating ground color)
+        med_A = float(np.median(A))
+        mad_A = float(np.median(np.abs(A - med_A)) * 1.4826 + 3.5)
+        med_B = float(np.median(B))
+        mad_B = float(np.median(np.abs(B - med_B)) * 1.4826 + 3.5)
+        z_color = np.sqrt(((A - med_A) / mad_A) ** 2 + ((B - med_B) / mad_B) ** 2)
+
+        # 2. Local Luminance Contrast Normalized by Terrain Texture Floor (rejects rocky gravel noise)
+        bg_L = cv2.GaussianBlur(L, (35, 35), 10.0)
         diff_L = np.abs(L - bg_L)
-        std_L = float(np.std(diff_L) + 5.0)
-        z_L = diff_L / std_L
+        med_L = float(np.median(diff_L))
+        mad_L = float(np.median(np.abs(diff_L - med_L)) * 1.4826 + 4.5)
+        z_luma = (diff_L - med_L) / mad_L
 
-        # Global chromaticity outlier score
-        mean_A, std_A = float(np.mean(A)), float(np.std(A) + 4.0)
-        mean_B, std_B = float(np.mean(B)), float(np.std(B) + 4.0)
-        z_C = np.sqrt(((A - mean_A) / std_A) ** 2 + ((B - mean_B) / std_B) ** 2)
+        # 3. Sharp Edge Density (Man-made tools/sensors have sharp edges vs rough dusty rocks)
+        gx = cv2.Sobel(L, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = cv2.GaussianBlur(np.sqrt(gx * gx + gy * gy), (7, 7), 2.0)
+        med_G = float(np.median(grad_mag))
+        mad_G = float(np.median(np.abs(grad_mag - med_G)) * 1.4826 + 8.0)
+        z_edge = (grad_mag - med_G) / mad_G
 
-        # Combined structural + spectral anomaly score
-        z_combined = np.maximum(z_L, z_C * 0.95)
-        mask = (z_combined >= self.anomaly_z_thresh).astype(np.uint8) * 255
+        # Fused score: requires strong color anomaly OR strong (luma contrast + sharp edges)
+        structural_score = 0.60 * z_luma + 0.40 * z_edge
+        fused_z = np.maximum(z_color * 0.95, structural_score)
 
-        # Ignore outer 4% border & bottom-corner drone landing gear regions
-        margin_x = int(det_w * 0.06)
-        margin_y = int(det_h * 0.06)
+        mask = (fused_z >= self.anomaly_z_thresh).astype(np.uint8) * 255
+
+        # Mask out outer frame borders, bottom-corner landing gear, and top-left OSD text
+        margin_x = int(det_w * 0.08)
+        margin_y = int(det_h * 0.08)
         mask[:margin_y, :] = 0
         mask[det_h - margin_y :, :] = 0
         mask[:, :margin_x] = 0
         mask[:, det_w - margin_x :] = 0
-        # Mask top-left OSD text ("PAL HD 1080P")
-        mask[: int(det_h * 0.16), : int(det_w * 0.30)] = 0
+        mask[: int(det_h * 0.18), : int(det_w * 0.32)] = 0
 
         k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
-        min_area = (det_w * det_h) * 0.00045
-        max_area = (det_w * det_h) * 0.12
+        min_area = (det_w * det_h) * 0.0006
+        max_area = (det_w * det_h) * 0.10
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -402,14 +407,13 @@ class FPVDetector:
 
             sx, sy, sbw, sbh = cv2.boundingRect(cnt)
             aspect = sbw / float(max(sbh, 1))
-            # Reject long thin floor seams / cracks
-            if aspect > 4.2 or aspect < 0.24:
+            if aspect > 4.0 or aspect < 0.25:
                 continue
 
-            peak_z = float(np.max(z_combined[sy : sy + sbh, sx : sx + sbw]))
-            conf = float(np.clip(peak_z / 5.5, 0.45, 0.99))
+            peak_z = float(np.max(fused_z[sy : sy + sbh, sx : sx + sbw]))
+            conf = float(np.clip(peak_z / 6.5, 0.50, 0.99))
 
-            pad = 6
+            pad = 8
             x1 = max(0, int((sx - 2) * sx_factor) - pad)
             y1 = max(0, int((sy - 2) * sy_factor) - pad)
             x2 = min(w - 1, int((sx + sbw + 2) * sx_factor) + pad)
@@ -433,10 +437,6 @@ class FPVDetector:
     def detect_and_annotate(
         self, frame: np.ndarray, draw_hud: bool = True, perf_stats: Optional[Dict[str, float]] = None
     ) -> Tuple[np.ndarray, List[Detection], Dict[str, float]]:
-        """
-        Runs throttled foreground anomaly + YOLO proposals, updates persistent tracker,
-        and renders clean, non-flickering bounding boxes at full 60 FPS.
-        """
         t0 = time.perf_counter()
         h, w = frame.shape[:2]
         self.frame_counter += 1
@@ -445,7 +445,7 @@ class FPVDetector:
             raw_proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
             if self.enable_color_anomaly:
-                raw_proposals.extend(self._detect_foreground_anomalies(frame))
+                raw_proposals.extend(self._detect_terrain_anomalies(frame))
 
             if self.enable_yolo and self.yolo_session is not None:
                 with self._yolo_lock:
@@ -460,14 +460,12 @@ class FPVDetector:
             merged = self._merge_proposals_nms(raw_proposals)
             detections = self.tracker.update(merged, w, h)
         else:
-            # On intermediate frames, draw retained & smoothed boxes (< 0.1 ms)
             detections = self.tracker.get_retained(w, h)
 
         detect_ms = (time.perf_counter() - t0) * 1000.0
         annotated = frame
         cx, cy = w // 2, h // 2
 
-        # Center boresight crosshair
         cv2.line(annotated, (cx - 18, cy), (cx - 5, cy), (180, 255, 180), 1, cv2.LINE_AA)
         cv2.line(annotated, (cx + 5, cy), (cx + 18, cy), (180, 255, 180), 1, cv2.LINE_AA)
         cv2.line(annotated, (cx, cy - 18), (cx, cy - 5), (180, 255, 180), 1, cv2.LINE_AA)
@@ -478,7 +476,6 @@ class FPVDetector:
             tcx, tcy = det.center
             color = det.color_bgr
 
-            # Clean bounding box + center marker (no noisy class labels)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             cv2.circle(annotated, (tcx, tcy), 4, color, -1, cv2.LINE_AA)
             cv2.putText(
@@ -518,7 +515,7 @@ class FPVDetector:
             f"FPV-ML [{mode_str}] {w}x{h} | {fps:4.1f} FPS | "
             f"DELAY: {e2e_ms:4.1f}ms (<120ms OK) [SR:{enh_ms:4.1f}ms DET:{detect_ms:4.1f}ms]"
         )
-        hud_right = f"ANOMALIES LOCKED: {len(detections)}"
+        hud_right = f"OBJECTS DETECTED: {len(detections)}"
 
         cv2.putText(
             canvas, hud_left, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 180), 1, cv2.LINE_AA

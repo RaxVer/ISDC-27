@@ -115,11 +115,11 @@ def parse_args() -> argparse.Namespace:
         help="QGC stream protocol: 'rtp' (QGC 'UDP h.264 Video Stream') or 'mpegts' (QGC 'MPEG-TS (h.264)')",
     )
     parser.add_argument("--bitrate", type=int, default=5500, help="H.264 stream bitrate in kbps (default: 5500)")
-    parser.add_argument("--no-yolo", action="store_true", help="Disable YOLOv8n object detection")
-    parser.add_argument("--no-shapes", action="store_true", help="Disable geometric shape & landing pad detection")
-    parser.add_argument("--no-anomaly", action="store_true", help="Disable spectral color abnormality detection")
-    parser.add_argument("--split-view", action="store_true", help="Show Raw vs Enhanced split comparison in stream")
-    parser.add_argument("--preview", action="store_true", help="Also open local OpenCV preview window with hotkeys")
+    parser.add_argument("--yolo", action="store_true", help="Also include COCO YOLOv8n box proposals")
+    parser.add_argument("--no-anomaly", action="store_true", help="Disable terrain foreign-object/anomaly detection")
+    parser.add_argument("--split-view", action="store_true", help="Show Raw vs Enhanced split comparison")
+    parser.add_argument("--stream-qgc", action="store_true", help="Also stream H.264 RTP to QGroundControl (UDP 5600)")
+    parser.add_argument("--no-preview", action="store_true", help="Disable local full-quality preview window")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 = run continuously)")
     parser.add_argument("--save-sample", type=str, default="", help="Optional path to save a sample output PNG frame")
     return parser.parse_args()
@@ -127,15 +127,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    show_preview = not args.no_preview
 
     out_w = int(round(args.input_width * args.upscale))
     out_h = int(round(args.input_height * args.upscale))
-    # Ensure even dimensions for YUV420p H.264 encoding
     out_w += out_w % 2
     out_h += out_h % 2
 
     print("=" * 78)
-    print("  FPV DRONE ML ENHANCEMENT & MULTI-MODAL DETECTION -> QGROUNDCONTROL PIPELINE")
+    print("  FPV DRONE ML ENHANCEMENT & TERRAIN ANOMALY DETECTION PIPELINE")
     print("=" * 78)
 
     video_source = FPVVideoSource(
@@ -155,37 +155,30 @@ def main() -> int:
     )
 
     detector = FPVDetector(
-        enable_yolo=not args.no_yolo,
-        enable_shapes=not args.no_shapes,
+        enable_yolo=args.yolo,
+        enable_shapes=False,
         enable_color_anomaly=not args.no_anomaly,
     )
 
-    extra_list: List[str] = [t.strip() for t in args.extra_targets.split(",") if t.strip()]
-    streamer = QGCStreamer(
-        width=out_w,
-        height=out_h,
-        fps=args.fps,
-        host=args.udp_host,
-        port=args.udp_port,
-        extra_targets=extra_list,
-        stream_format=args.stream_format,
-        bitrate_kbps=args.bitrate,
-    )
+    streamer = None
+    if args.stream_qgc:
+        extra_list: List[str] = [t.strip() for t in args.extra_targets.split(",") if t.strip()]
+        streamer = QGCStreamer(
+            width=out_w,
+            height=out_h,
+            fps=args.fps,
+            host=args.udp_host,
+            port=args.udp_port,
+            extra_targets=extra_list,
+            stream_format=args.stream_format,
+            bitrate_kbps=args.bitrate,
+        )
 
     print(f"  [*] Video Source      : {video_source.source_description} ({args.input_width}x{args.input_height} @ {args.fps}fps)")
     print(f"  [*] ML Enhancer       : {enhancer.backend_name} | Mode: {enhancer.mode} -> {out_w}x{out_h}")
-    print(
-        f"  [*] Detection Heads   : YOLO={detector.yolo_status} | "
-        f"Shapes={'ON' if detector.enable_shapes else 'OFF'} | "
-        f"ColorAnomaly={'ON' if detector.enable_color_anomaly else 'OFF'}"
-    )
-    print(f"  [*] QGC Video Output  : {streamer.backend_used}")
-    print(f"  [*] Latency Budget    : Target < 120.0 ms (Zero-Buffer Sliced-Threads H.264 RTP)")
-    print(
-        f"  [*] QGC Setting       : Application Settings -> General -> Video -> "
-        f"{'UDP h.264 Video Stream' if args.stream_format == 'rtp' else 'MPEG-TS (h.264) Video Stream'} "
-        f"| UDP Port: {args.udp_port}"
-    )
+    print(f"  [*] Detection Engine  : {detector.yolo_status} | Anomaly={'ON' if detector.enable_color_anomaly else 'OFF'}")
+    print(f"  [*] Local Display     : {'FULL ' + str(out_w) + 'x' + str(out_h) if show_preview else 'DISABLED'}")
+    print(f"  [*] QGC Video Output  : {streamer.backend_used if streamer else 'DISABLED (Local Mode — add --stream-qgc to enable)'}")
     print("=" * 78)
 
     running = True
@@ -199,10 +192,15 @@ def main() -> int:
 
     frame_count = 0
     fps_ema = float(args.fps)
-    e2e_delay_ema = 18.0
+    e2e_delay_ema = 8.0
     split_view = args.split_view
     frame_interval = 1.0 / max(1, args.fps)
     sample_saved = False
+
+    if show_preview:
+        win_name = f"FPV ML Pipeline ({out_w}x{out_h}) [e=Mode y=YOLO c=Detect v=Split q=Quit]"
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_name, min(out_w, 1600), min(out_h, 900))
 
     try:
         while running:
@@ -214,10 +212,10 @@ def main() -> int:
 
             t_proc_start = time.perf_counter()
 
-            # Stage 1: Neural Detail/Super-Resolution + Temporal Recurrent Denoising
+            # Stage 1: Crisp Neural Detail/Super-Resolution + Mild Temporal RNN
             enhanced_frame, enh_metrics = enhancer.enhance(raw_frame)
 
-            # Stage 2: Multi-Modal Real-Time Detection (YOLO + Geometric Shapes + Color Anomalies)
+            # Stage 2: Martian-Terrain Foreign-Object / Anomaly Detection
             perf_stats = {
                 "fps": fps_ema,
                 "enhance_ms": enh_metrics["enhance_ms"],
@@ -234,10 +232,10 @@ def main() -> int:
                 else annotated_frame
             )
 
-            # Stage 3: Stream Zero-Buffer H.264 RTP/MPEG-TS to QGroundControl
-            streamer.write(output_frame)
+            # Stage 3: Optional QGroundControl H.264 RTP Stream
+            if streamer is not None:
+                streamer.write(output_frame)
 
-            # Measure total frame processing + H.264 pipe flush delay (ms)
             proc_delay_ms = (time.perf_counter() - t_proc_start) * 1000.0
             e2e_delay_ema = 0.85 * e2e_delay_ema + 0.15 * proc_delay_ms
             frame_count += 1
@@ -247,9 +245,8 @@ def main() -> int:
                 print(f"  [+] Saved sample output frame to: {args.save_sample}")
                 sample_saved = True
 
-            if args.preview:
-                disp = cv2.resize(output_frame, (960, 540), interpolation=cv2.INTER_NEAREST) if output_frame.shape[1] > 960 else output_frame
-                cv2.imshow("FPV ML Preview (1080p60 -> QGC) [e=Mode y=YOLO c=Anomaly v=Split q=Quit]", disp)
+            if show_preview:
+                cv2.imshow(win_name, output_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
                     break
@@ -258,8 +255,6 @@ def main() -> int:
                     enhancer.mode = modes[(modes.index(enhancer.mode) + 1) % len(modes)]
                 elif key == ord("y"):
                     detector.enable_yolo = not detector.enable_yolo
-                elif key == ord("s"):
-                    detector.enable_shapes = not detector.enable_shapes
                 elif key == ord("c"):
                     detector.enable_color_anomaly = not detector.enable_color_anomaly
                 elif key == ord("v"):
@@ -293,9 +288,10 @@ def main() -> int:
 
     finally:
         detector.close()
-        streamer.close()
+        if streamer is not None:
+            streamer.close()
         video_source.release()
-        if args.preview:
+        if show_preview:
             cv2.destroyAllWindows()
         print("  [*] Pipeline stopped cleanly.")
 
