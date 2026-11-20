@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         help="QGC stream protocol: 'rtp' (QGC 'UDP h.264 Video Stream') or 'mpegts' (QGC 'MPEG-TS (h.264)')",
     )
     parser.add_argument("--bitrate", type=int, default=5500, help="H.264 stream bitrate in kbps (default: 5500)")
-    parser.add_argument("--yolo", action="store_true", help="Also include COCO YOLOv8n box proposals")
+    parser.add_argument("--no-yolo", action="store_true", help="Disable YOLOv8s deep objectness proposals")
     parser.add_argument("--no-anomaly", action="store_true", help="Disable terrain foreign-object/anomaly detection")
     parser.add_argument("--split-view", action="store_true", help="Show Raw vs Enhanced split comparison")
     parser.add_argument("--stream-qgc", action="store_true", help="Also stream H.264 RTP to QGroundControl (UDP 5600)")
@@ -155,7 +155,7 @@ def main() -> int:
     )
 
     detector = FPVDetector(
-        enable_yolo=args.yolo,
+        enable_yolo=not args.no_yolo,
         enable_shapes=False,
         enable_color_anomaly=not args.no_anomaly,
     )

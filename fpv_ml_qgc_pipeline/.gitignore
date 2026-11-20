@@ -13,3 +13,4 @@ models/yolov8n.onnx
 *.pt
 *.mp4
 *.avi
+models/yolov8s.onnx
