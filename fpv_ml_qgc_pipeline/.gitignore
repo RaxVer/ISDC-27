@@ -8,9 +8,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Large auto-downloaded YOLO weights (auto-fetched on first run of pipeline.py)
+# Large auto-downloaded / exported YOLO weights (auto-fetched on first run)
 models/yolov8n.onnx
+models/yolov8s.onnx
+models/yolo11n.onnx
+models/yolo11s.onnx
 *.pt
 *.mp4
 *.avi
-models/yolov8s.onnx

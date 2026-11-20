@@ -266,31 +266,40 @@ class FPVDetector:
             self._yolo_thread.join(timeout=1.5)
 
     def _init_yolo_onnx(self) -> None:
+        """
+        Loads official Ultralytics YOLO11s (`yolo11s.pt`) exported with `opset=12` (`models/yolo11s.onnx`).
+        Using official Ultralytics `opset=12` export eliminates FPN Resize/Upsample coordinate drift
+        and third-party ONNX export accuracy loss.
+        """
         models_dir = Path(__file__).resolve().parent / "models"
         models_dir.mkdir(parents=True, exist_ok=True)
-        # Prefer heavier YOLOv8s if present, fallback to YOLOv8n
-        onnx_path_s = models_dir / "yolov8s.onnx"
-        onnx_path_n = models_dir / "yolov8n.onnx"
+        yolo11s_onnx = models_dir / "yolo11s.onnx"
+        yolo11s_pt = models_dir / "yolo11s.pt"
 
         active_path = None
-        if onnx_path_s.exists() and onnx_path_s.stat().st_size > 5_000_000:
-            active_path = onnx_path_s
-        else:
-            # Try downloading heavier YOLOv8s first (22MB), fallback to cached YOLOv8n
-            try:
-                url_s = YOLO_ONNX_URLS[0]
-                print(f"[FPVDetector] Fetching heavier YOLOv8s ONNX model ({url_s})...")
-                req = urllib.request.Request(url_s, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp, open(onnx_path_s, "wb") as f:
-                    f.write(resp.read())
-                if onnx_path_s.stat().st_size > 5_000_000:
-                    active_path = onnx_path_s
-            except Exception:
-                if onnx_path_s.exists():
-                    onnx_path_s.unlink(missing_ok=True)
 
-        if active_path is None and onnx_path_n.exists() and onnx_path_n.stat().st_size > 1_000_000:
-            active_path = onnx_path_n
+        # 1. If official opset=12 yolo11s.onnx is already exported, use it directly
+        if yolo11s_onnx.exists() and yolo11s_onnx.stat().st_size > 5_000_000:
+            active_path = yolo11s_onnx
+        else:
+            # Export yolo11s.pt -> yolo11s.onnx with explicit opset=12 via official Ultralytics exporter
+            try:
+                from ultralytics import YOLO
+
+                print("[FPVDetector] Loading official YOLO11s & exporting to ONNX with opset=12...")
+                model = YOLO(str(yolo11s_pt))
+                exported = model.export(format="onnx", opset=12, imgsz=640)
+                if exported and Path(exported).exists():
+                    active_path = Path(exported)
+            except Exception as exc:
+                print(f"[FPVDetector] Note: Ultralytics live export not yet ready ({exc}), checking fallback...")
+
+        # Fallback to yolov8s.onnx / yolov8n.onnx only if yolo11s is not yet exported
+        if active_path is None:
+            for cand in (models_dir / "yolov8s.onnx", models_dir / "yolov8n.onnx"):
+                if cand.exists() and cand.stat().st_size > 1_000_000:
+                    active_path = cand
+                    break
 
         if active_path is not None:
             try:
@@ -311,7 +320,7 @@ class FPVDetector:
                 shape = inp_meta.shape
                 if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
                     self.yolo_model_hw = (shape[2], shape[3])
-                self.yolo_status = f"Ground-Plane Anomaly + {active_path.stem.upper()} (Async)"
+                self.yolo_status = f"Ground-Plane + {active_path.stem.upper()} (opset=12 Async)"
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
             except Exception:

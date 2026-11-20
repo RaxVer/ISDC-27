@@ -241,7 +241,7 @@ def ensure_espcn_onnx_model(model_path: Optional[str] = None) -> str:
         model = helper.make_model(
             graph,
             producer_name="fpv_ml_qgc_pipeline",
-            opset_imports=[helper.make_opsetid("", 13)],
+            opset_imports=[helper.make_opsetid("", 12)],
         )
         model.ir_version = 8
         onnx.save(model, model_path)
