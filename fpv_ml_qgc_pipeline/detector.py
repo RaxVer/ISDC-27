@@ -588,17 +588,27 @@ class FPVDetector:
         for det in detections:
             x1, y1, x2, y2 = det.bbox
             tcx, tcy = det.center
-            color = det.color_bgr
+            # High-contrast Neon Magenta (rare in natural terrain/rocks/moss) + Black Halo
+            box_color = (220, 30, 255)
 
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-            cv2.circle(annotated, (tcx, tcy), 4, (0, 255, 255), -1, cv2.LINE_AA)
+            # Black contrast halo + Vivid Neon Magenta box (pops on white glare, dark shadows, moss, and Martian sand)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 0), 5)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
+            cv2.circle(annotated, (tcx, tcy), 5, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(annotated, (tcx, tcy), 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+            # Solid dark pill behind label text so it is always 100% readable
+            (tw, th), _ = cv2.getTextSize(det.label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            ly = max(th + 42, y1 - 6)
+            cv2.rectangle(annotated, (x1, ly - th - 6), (x1 + tw + 10, ly + 4), (12, 12, 16), -1)
+            cv2.rectangle(annotated, (x1, ly - th - 6), (x1 + tw + 10, ly + 4), box_color, 1)
             cv2.putText(
                 annotated,
                 det.label,
-                (x1, max(48, y1 - 8)),
+                (x1 + 5, ly - 1),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                color,
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
