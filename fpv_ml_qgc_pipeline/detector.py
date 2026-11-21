@@ -164,57 +164,49 @@ class _AnomalyTracker:
 
 def _build_ground_arena_mask(w: int, h: int) -> np.ndarray:
     """
-    Constructs the active Ground Search Arena mask on (w, h):
-    Excludes:
-      - Drone left foam landing leg (bottom-left)
-      - Drone right foam landing leg (bottom-right)
-      - Top-left OSD ("PAL HD 1080P") & curved arena rim
-      - Far top-right corner cables & horizon edge
+    Constructs a tight, pixel-accurate Ground Search Arena mask on (w, h):
+    - Masks ONLY the thin left & right foam landing gear tubes + bottom carbon brackets
+      and the small 'PAL HD 720P' OSD text box.
+    - Keeps the entire outer fisheye ground arena (left edge, top-right, bottom-right)
+      OPEN for detection!
     """
     mask = np.full((h, w), 255, dtype=np.uint8)
 
-    # 1. Outer frame border margin (5%)
-    mx, my = int(w * 0.05), int(h * 0.06)
+    # 1. Minimal 1.5% outer frame border margin (preserves fisheye outer edges!)
+    mx, my = max(2, int(w * 0.015)), max(2, int(h * 0.02))
     mask[:my, :] = 0
     mask[h - my :, :] = 0
     mask[:, :mx] = 0
     mask[:, w - mx :] = 0
 
-    # 2. Left Drone Foam Landing Leg exclusion zone
-    left_leg = np.array([
-        [0, int(h * 0.25)],
-        [int(w * 0.27), int(h * 0.27)],
+    # 2. Left Landing Gear Curved Foam Tube + Bottom-Left Carbon Bracket
+    left_leg_tube = np.array([
+        [int(w * 0.08), h],
         [int(w * 0.21), h],
-        [0, h],
+        [int(w * 0.24), int(h * 0.58)],
+        [int(w * 0.30), int(h * 0.23)],
+        [int(w * 0.19), int(h * 0.23)],
+        [int(w * 0.12), int(h * 0.58)],
     ], dtype=np.int32)
-    cv2.fillPoly(mask, [left_leg], 0)
+    cv2.fillPoly(mask, [left_leg_tube], 0)
+    cv2.rectangle(mask, (0, int(h * 0.85)), (int(w * 0.21), h), 0, -1)
 
-    # 3. Right Drone Foam Landing Leg exclusion zone
-    right_leg = np.array([
-        [int(w * 0.72), int(h * 0.33)],
-        [w, int(h * 0.30)],
-        [w, h],
-        [int(w * 0.75), h],
+    # 3. Right Landing Gear Curved Foam Tube + Bottom-Right Carbon Bracket
+    # Covers full width of right foam leg while leaving bottom-right jacket area (x=0.75..0.84) OPEN!
+    right_leg_tube = np.array([
+        [int(w * 0.85), h],
+        [int(w * 0.98), h],
+        [int(w * 0.97), int(h * 0.58)],
+        [int(w * 0.89), int(h * 0.22)],
+        [int(w * 0.78), int(h * 0.22)],
+        [int(w * 0.84), int(h * 0.58)],
     ], dtype=np.int32)
-    cv2.fillPoly(mask, [right_leg], 0)
+    cv2.fillPoly(mask, [right_leg_tube], 0)
+    cv2.rectangle(mask, (int(w * 0.86), int(h * 0.85)), (w, h), 0, -1)
 
-    # 4. Top-Left OSD ("PAL HD 1080P") & curved horizon corner
-    top_left = np.array([
-        [0, 0],
-        [int(w * 0.48), 0],
-        [int(w * 0.32), int(h * 0.22)],
-        [0, int(h * 0.32)],
-    ], dtype=np.int32)
-    cv2.fillPoly(mask, [top_left], 0)
-
-    # 5. Top-Right Far Corner Cables & edge clutter
-    top_right = np.array([
-        [int(w * 0.52), 0],
-        [w, 0],
-        [w, int(h * 0.38)],
-        [int(w * 0.62), int(h * 0.16)],
-    ], dtype=np.int32)
-    cv2.fillPoly(mask, [top_right], 0)
+    # 4. Top-Left OSD Box ('PAL HD 720P') & Top-Left Corner Roof/Sky Clutter
+    cv2.rectangle(mask, (int(w * 0.13), int(h * 0.02)), (int(w * 0.31), int(h * 0.16)), 0, -1)
+    cv2.fillPoly(mask, [np.array([[0, 0], [int(w * 0.22), 0], [0, int(h * 0.30)]], dtype=np.int32)], 0)
 
     return mask
 
@@ -225,12 +217,12 @@ class FPVDetector:
         enable_yolo: bool = True,
         enable_shapes: bool = False,
         enable_color_anomaly: bool = True,
-        yolo_conf_thresh: float = 0.20,
+        yolo_conf_thresh: float = 0.18,
         yolo_iou_thresh: float = 0.40,
         yolo_input_size: int = 640,
-        anomaly_z_thresh: float = 3.4,
+        anomaly_z_thresh: float = 3.0,
         detect_every_n: int = 2,
-        hold_frames: int = 4,
+        hold_frames: int = 8,
     ):
         self.enable_yolo = enable_yolo
         self.enable_shapes = enable_shapes
@@ -467,17 +459,17 @@ class FPVDetector:
         k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         thresh = self.anomaly_z_thresh
 
-        mask_pos = cv2.morphologyEx(((z_pos >= thresh) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
+        mask_pos = cv2.morphologyEx(((z_pos >= thresh + 0.5) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
         mask_neg = cv2.morphologyEx(((z_neg >= thresh) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
-        mask_col = cv2.morphologyEx(((z_color >= thresh) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
+        mask_col = cv2.morphologyEx(((z_color >= thresh + 0.4) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
 
         fused_z = np.maximum(np.maximum(z_pos, z_neg), z_color * 0.90)
         proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
-        min_area = 16.0
-        max_area = (det_w * det_h) * 0.16
+        min_area = 14.0
+        max_area = (det_w * det_h) * 0.15
 
-        for mask_channel in (mask_pos, mask_neg, mask_col):
+        for ch_idx, mask_channel in enumerate((mask_pos, mask_neg, mask_col)):
             contours, _ = cv2.findContours(mask_channel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
                 area = cv2.contourArea(cnt)
@@ -490,7 +482,7 @@ class FPVDetector:
                     continue
 
                 hull_area = max(1.0, cv2.contourArea(cv2.convexHull(cnt)))
-                if (area / hull_area) < 0.52:
+                if (area / hull_area) < 0.50:
                     continue
 
                 rx1, ry1 = max(0, sx - 6), max(0, sy - 6)
@@ -508,11 +500,16 @@ class FPVDetector:
                 roi_C = chroma_mag[ry1:ry2, rx1:rx2]
                 box_dC = float(np.mean(roi_C[box_region]))
 
-                if box_dL < 21.0 and box_dC < 14.0:
+                # Bright patches need higher contrast (27.0) to ignore sunlit concrete; dark objects/tools need 20.0; color needs 16.0
+                if ch_idx == 0 and box_dL < 27.0:
+                    continue
+                elif ch_idx == 1 and box_dL < 20.0:
+                    continue
+                elif ch_idx == 2 and box_dC < 26.0:
                     continue
 
                 peak_z = float(np.max(fused_z[sy : sy + sbh, sx : sx + sbw]))
-                if peak_z < 3.8:
+                if peak_z < 4.0:
                     continue
 
                 conf = float(np.clip((box_dL + box_dC * 1.5) / 50.0, 0.55, 0.99))
@@ -531,33 +528,13 @@ class FPVDetector:
         if len(proposals) <= 1:
             return proposals
 
-        kept = list(proposals)
-        changed = True
-        while changed:
-            changed = False
-            merged: List[Tuple[Tuple[int, int, int, int], float]] = []
-            used = [False] * len(kept)
-            for i in range(len(kept)):
-                if used[i]:
-                    continue
-                bx1, by1, bx2, by2 = kept[i][0]
-                bconf = kept[i][1]
-                used[i] = True
-                for j in range(i + 1, len(kept)):
-                    if used[j]:
-                        continue
-                    ox1, oy1, ox2, oy2 = kept[j][0]
-                    h_gap = max(0, max(bx1, ox1) - min(bx2, ox2))
-                    v_gap = max(0, max(by1, oy1) - min(by2, oy2))
-                    if h_gap <= 24 and v_gap <= 24:
-                        bx1, by1 = min(bx1, ox1), min(by1, oy1)
-                        bx2, by2 = max(bx2, ox2), max(by2, oy2)
-                        bconf = max(bconf, kept[j][1])
-                        used[j] = True
-                        changed = True
-                merged.append(((bx1, by1, bx2, by2), bconf))
-            kept = merged
-        return kept
+        # Strict overlap-only merge (never chain separate distant boxes into one giant box)
+        boxes = [[x1, y1, x2 - x1, y2 - y1] for (x1, y1, x2, y2), _ in proposals]
+        scores = [c for _, c in proposals]
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, 0.25, 0.35)
+        if len(idxs) == 0:
+            return []
+        return [proposals[i] for i in np.array(idxs).flatten()]
 
     def detect_and_annotate(
         self,
