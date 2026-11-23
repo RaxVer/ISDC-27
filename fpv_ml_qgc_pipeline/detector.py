@@ -223,7 +223,7 @@ class FPVDetector:
         enable_color_anomaly: bool = True,
         yolo_conf_thresh: float = 0.18,
         yolo_iou_thresh: float = 0.40,
-        yolo_input_size: int = 960,
+        yolo_input_size: int = 1280,
         anomaly_z_thresh: float = 3.0,
         detect_every_n: int = 2,
         hold_frames: int = 8,
@@ -242,11 +242,11 @@ class FPVDetector:
 
         self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.48)
 
-        # Upgrade #4: 960x540 High-Resolution Ground-Plane Grid (9x pixel density of original 320x180)
-        self.det_w, self.det_h = 960, 540
+        # Full Native 1280x720 Ground-Plane Anomaly Grid (16x pixel density of original 320x180)
+        self.det_w, self.det_h = 1280, 720
         self.arena_mask_small = _build_ground_arena_mask(self.det_w, self.det_h)
 
-        # Upgrade #2: Homography-Stabilized Temporal Anomaly Evidence Accumulation Maps on 960x540
+        # Homography-Stabilized Temporal Anomaly Evidence Accumulation Maps on 1280x720
         self.accum_pos: Optional[np.ndarray] = None
         self.accum_neg: Optional[np.ndarray] = None
         self.accum_col: Optional[np.ndarray] = None
@@ -254,8 +254,8 @@ class FPVDetector:
 
         self.yolo_session = None
         self.yolo_input_name = None
-        self.yolo_model_hw = (960, 960)
-        self.yolo_status = "960x540 Ground-Grid + Temporal Homography Map"
+        self.yolo_model_hw = (1280, 1280)
+        self.yolo_status = "1280x720 Ground-Grid + Temporal Homography Map"
 
         self._yolo_lock = threading.Lock()
         self._yolo_pending_frame: Optional[np.ndarray] = None
@@ -273,7 +273,7 @@ class FPVDetector:
 
     def _init_yolo_onnx(self) -> None:
         """
-        Loads official Ultralytics YOLO11m (`yolo11m.onnx` at 960x960, opset=12) on RTX 4060 CUDA.
+        Loads official Ultralytics YOLO11m (`yolo11m.onnx` at 1280x1280, opset=12) on RTX 4060 CUDA.
         Falls back to yolo11s.onnx / yolov8s.onnx if yolo11m.onnx is not present.
         """
         models_dir = Path(__file__).resolve().parent / "models"
@@ -288,9 +288,9 @@ class FPVDetector:
             try:
                 from ultralytics import YOLO
 
-                print("[FPVDetector] Exporting official YOLO11m (960x960, opset=12)...")
+                print("[FPVDetector] Exporting official YOLO11m (1280x1280, opset=12)...")
                 model = YOLO(str(yolo11m_pt))
-                exported = model.export(format="onnx", opset=12, imgsz=960)
+                exported = model.export(format="onnx", opset=12, imgsz=1280)
                 if exported and Path(exported).exists():
                     active_path = Path(exported)
             except Exception as exc:
@@ -328,7 +328,7 @@ class FPVDetector:
                     self.yolo_model_hw = (shape[2], shape[3])
                 active_prov = self.yolo_session.get_providers()[0].replace("ExecutionProvider", "")
                 self.yolo_status = (
-                    f"960x540 Homography-Grid + {active_path.stem.upper()}@{self.yolo_model_hw[0]} ({active_prov} opset=12)"
+                    f"1280x720 Homography-Grid + {active_path.stem.upper()}@{self.yolo_model_hw[0]} ({active_prov} opset=12)"
                 )
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
@@ -419,15 +419,18 @@ class FPVDetector:
         self, frame: np.ndarray, H_960: np.ndarray, single_frame_mode: bool = False
     ) -> List[Tuple[Tuple[int, int, int, int], float]]:
         """
-        960x540 High-Resolution Dual-Scale Signed Ground-Plane Anomaly Detector
-        with Homography-Stabilized Temporal Evidence Accumulation (Upgrade #2 & #4).
+        Full 1280x720 High-Resolution Dual-Scale Signed Ground-Plane Anomaly Detector
+        with Homography-Stabilized Temporal Evidence Accumulation (16x area of original 320x180).
         """
         h, w = frame.shape[:2]
         det_w, det_h = self.det_w, self.det_h
         sx_factor, sy_factor = w / float(det_w), h / float(det_h)
 
-        # 1. Downscale to 960x540 + 5x5 Median-Gaussian pre-filter
-        small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
+        # 1. Sample at full 1280x720 + 5x5 Median-Gaussian pre-filter
+        if (w, h) == (det_w, det_h):
+            small = frame
+        else:
+            small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
         small_clean = cv2.GaussianBlur(cv2.medianBlur(small, 5), (5, 5), 1.2)
 
         lab = cv2.cvtColor(small_clean, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -438,16 +441,16 @@ class FPVDetector:
         arena_bool = self.arena_mask_small > 0
 
         # 2. Wide Ground-Plane Illumination Model (catches medium/large boxes, jackets, containers)
-        coarse_L = cv2.resize(L, (12, 7), interpolation=cv2.INTER_AREA)
+        coarse_L = cv2.resize(L, (16, 9), interpolation=cv2.INTER_AREA)
         bg_wide = cv2.GaussianBlur(
-            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (75, 75), 22.0
+            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (95, 95), 28.0
         )
         diff_wide = L - bg_wide
         mad_wide = float(np.median(np.abs(diff_wide[arena_bool])) * 1.4826 + 3.5)
         z_wide = diff_wide / mad_wide
 
-        # 3. Local Ground-Plane Illumination Model at 960x540 (catches small tools, pliers, screws, sensors)
-        bg_local = cv2.GaussianBlur(L, (61, 61), 18.0)
+        # 3. Local Ground-Plane Illumination Model at 1280x720 (catches small tools, pliers, screws, sensors)
+        bg_local = cv2.GaussianBlur(L, (75, 75), 22.0)
         diff_local = L - bg_local
         mad_local = float(np.median(np.abs(diff_local[arena_bool])) * 1.4826 + 3.0)
         z_local = diff_local / mad_local
@@ -456,9 +459,9 @@ class FPVDetector:
         z_pos = np.maximum(0.0, z_signed)
         z_neg = np.maximum(0.0, -z_signed)
 
-        # 4. Chromaticity Outlier Score on 960x540
-        A_smooth = cv2.GaussianBlur(A, (21, 21), 5.5)
-        B_smooth = cv2.GaussianBlur(B, (21, 21), 5.5)
+        # 4. Chromaticity Outlier Score on 1280x720
+        A_smooth = cv2.GaussianBlur(A, (25, 25), 6.5)
+        B_smooth = cv2.GaussianBlur(B, (25, 25), 6.5)
         med_A = float(np.median(A_smooth[arena_bool]))
         mad_A = float(np.median(np.abs(A_smooth[arena_bool] - med_A)) * 1.4826 + 3.0)
         med_B = float(np.median(B_smooth[arena_bool]))
@@ -466,9 +469,9 @@ class FPVDetector:
         z_color = np.sqrt(((A_smooth - med_A) / mad_A) ** 2 + ((B_smooth - med_B) / mad_B) ** 2)
 
         chroma_mag = np.sqrt((A_smooth - med_A) ** 2 + (B_smooth - med_B) ** 2)
-        z_color = np.where(chroma_mag >= 16.0, z_color, 0.0)
+        z_color = np.where(chroma_mag >= 14.5, z_color, 0.0)
 
-        # 5. Upgrade #2: Homography-Stabilized Temporal Anomaly Evidence Accumulation
+        # 5. Upgrade #2: Homography-Stabilized Temporal Anomaly Evidence Accumulation on 1280x720
         if (
             not single_frame_mode
             and self.accum_decay > 0.01
@@ -492,7 +495,7 @@ class FPVDetector:
             self.accum_col = z_color.copy()
             eff_pos, eff_neg, eff_col = z_pos, z_neg, z_color
 
-        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
         thresh = self.anomaly_z_thresh
 
         mask_pos = cv2.morphologyEx(((eff_pos >= thresh + 0.5) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
@@ -502,8 +505,8 @@ class FPVDetector:
         fused_z = np.maximum(np.maximum(eff_pos, eff_neg), eff_col * 0.90)
         proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
-        # On 960x540 (9x area of 320x180), min_area=85 catches tiny tools/screws (~9.5px on 320x180)
-        min_area = 85.0
+        # On 1280x720 (16x area of 320x180), min_area=140 catches tiny tools/screws (~8.75px on 320x180)
+        min_area = 140.0
         max_area = (det_w * det_h) * 0.15
 
         for ch_idx, mask_channel in enumerate((mask_pos, mask_neg, mask_col)):
