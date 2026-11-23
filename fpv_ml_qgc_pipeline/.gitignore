@@ -14,6 +14,7 @@ models/yolov8s.onnx
 models/yolo11n.onnx
 models/yolo11s.onnx
 models/yolo11m.onnx
+models/yolo11m_fp16.onnx
 *.pt
 *.mp4
 *.avi

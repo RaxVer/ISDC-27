@@ -61,11 +61,12 @@ class FPVEnhancer:
         self._map_x: Optional[np.ndarray] = None
         self._map_y: Optional[np.ndarray] = None
 
-        # High-Res 640x360 Sparse Optical Flow (Lucas-Kanade) + RANSAC Homography MFSR state
+        # High-Res 640x360 Sparse Optical Flow (Lucas-Kanade) + RANSAC Homography + FFT Phase-Correlation Fallback
         self.hidden_state: Optional[np.ndarray] = None
         self.prev_lk_gray: Optional[np.ndarray] = None
         self.lk_w, self.lk_h = 640, 360
         self.lk_mask = self._build_lk_ground_mask(self.lk_w, self.lk_h)
+        self.fft_hann = cv2.createHanningWindow((self.lk_w, self.lk_h), cv2.CV_32F)
 
         self.clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(6, 6))
         self.luma_lut = _build_scurve_contrast_lut(contrast=1.18, gamma=0.95)
@@ -119,7 +120,7 @@ class FPVEnhancer:
                     self.ort_session = None
         except Exception:
             self.ort_session = None
-        self.backend_name = f"640x360 LK-Homography MFSR + Defish + 2.5K ESPCN ({self.device_provider})"
+        self.backend_name = f"640x360 LK+FFT Homography MFSR + Defish + 2.5K ESPCN ({self.device_provider})"
 
     def reset_state(self) -> None:
         self.hidden_state = None
@@ -127,7 +128,8 @@ class FPVEnhancer:
 
     def _lk_homography_mfsr_fusion(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        640x360 Sparse Optical Flow (Pyramidal Lucas-Kanade) + RANSAC 8-DOF Ground Homography MFSR:
+        640x360 Sparse Optical Flow (Pyramidal Lucas-Kanade) + RANSAC 8-DOF Ground Homography MFSR
+        with Sub-Pixel Fourier FFT Phase-Correlation Fallback over featureless sand:
         Returns:
           (multi_frame_stacked_bgr_at_full_native_res, H_320_normalized_homography_matrix)
         """
@@ -176,11 +178,30 @@ class FPVEnhancer:
                         det_h = float(np.linalg.det(H_est[:2, :2]))
                         if 0.70 <= det_h <= 1.40 and abs(H_est[0, 2]) < 130.0 and abs(H_est[1, 2]) < 130.0:
                             H_lk = H_est.astype(np.float32)
-                            # Normalize to 320x180 coordinate basis for downstream compatibility
-                            S_to_320 = np.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-                            S_from_320 = np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-                            H_320 = S_to_320 @ H_lk @ S_from_320
                             valid_homography = True
+
+        # 4. Upgrade #2: Sub-Pixel Fourier FFT Phase-Correlation Fallback when ground is smooth/featureless sand
+        if not valid_homography:
+            try:
+                (dx, dy), resp = cv2.phaseCorrelate(
+                    self.prev_lk_gray.astype(np.float32),
+                    lk_gray.astype(np.float32),
+                    self.fft_hann,
+                )
+                if resp > 0.06 and abs(dx) < 110.0 and abs(dy) < 110.0:
+                    H_lk = np.array(
+                        [[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]],
+                        dtype=np.float32,
+                    )
+                    valid_homography = True
+            except Exception:
+                pass
+
+        if valid_homography:
+            # Normalize to 320x180 coordinate basis for downstream compatibility
+            S_to_320 = np.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            S_from_320 = np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            H_320 = S_to_320 @ H_lk @ S_from_320
 
         self.prev_lk_gray = lk_gray
 
