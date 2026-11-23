@@ -76,6 +76,11 @@ class FPVEnhancer:
         try:
             import onnxruntime as ort
 
+            if hasattr(ort, "preload_dlls"):
+                try:
+                    ort.preload_dlls()
+                except Exception:
+                    pass
             avail = ort.get_available_providers()
             if "CUDAExecutionProvider" in avail:
                 sess_opts = ort.SessionOptions()
@@ -83,7 +88,10 @@ class FPVEnhancer:
                 self.ort_session = ort.InferenceSession(
                     onnx_path, sess_options=sess_opts, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
                 )
-                self.device_provider = "CUDA-GPU"
+                if "CUDAExecutionProvider" in self.ort_session.get_providers():
+                    self.device_provider = "RTX-4060-CUDA"
+                else:
+                    self.ort_session = None
         except Exception:
             self.ort_session = None
         self.backend_name = f"MFSR Sub-Pixel Stack + ESPCN ({self.device_provider}) + Ground-Mute"

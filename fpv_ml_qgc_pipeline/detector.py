@@ -294,6 +294,11 @@ class FPVDetector:
             try:
                 import onnxruntime as ort
 
+                if hasattr(ort, "preload_dlls"):
+                    try:
+                        ort.preload_dlls()
+                    except Exception:
+                        pass
                 sess_opts = ort.SessionOptions()
                 sess_opts.intra_op_num_threads = 4
                 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -309,8 +314,8 @@ class FPVDetector:
                 shape = inp_meta.shape
                 if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
                     self.yolo_model_hw = (shape[2], shape[3])
-                prov_short = providers[0].replace("ExecutionProvider", "")
-                self.yolo_status = f"640x360 Ground-Plane + {active_path.stem.upper()} ({prov_short} opset=12)"
+                active_prov = self.yolo_session.get_providers()[0].replace("ExecutionProvider", "")
+                self.yolo_status = f"640x360 Ground-Plane + {active_path.stem.upper()} ({active_prov} opset=12)"
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
             except Exception:
