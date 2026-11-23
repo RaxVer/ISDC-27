@@ -1,38 +1,28 @@
 """
-Heavy-Duty Ground-Arena Foreign-Object & Anomaly Detector (`FPVDetector`).
+RTX-4060 GPU-Accelerated 960x540 Ground-Plane Anomaly & YOLO11m (960x960, opset=12) Detector (`FPVDetector`).
 
-Engineered for FPV Drone ground inspection (Martian terrain / floor tools, boxes, sensors):
-1. Custom FPV Ground-Arena Mask (`_build_ground_arena_mask`):
-   Automatically masks out the drone's left & right foam landing legs, the top-left OSD/horizon rim,
-   and far top-right corner cables so only objects in the active ground search arena are detected.
-2. Multi-Scale Coarse-to-Fine Ground-Plane Subtraction + Median Denoising:
-   - Applies a 5x5 median + bilateral pre-filter to destroy analog composite rainbow floor noise.
-   - Models the true ground illumination & color plane at coarse 16x9 scale so medium/large objects
-     (like the white plastic box) as well as small objects (like a screw, plier, or sensor) pop out
-     across their entire body instead of being swallowed by a local filter.
-3. Center-Surround Ring Contrast Verification (Delta-E in CIE LAB):
-   - Verifies every candidate object by comparing its interior LAB color/brightness against the
-     surrounding ground ring immediately outside its bounding box, rejecting gradual floor shadows.
-4. Asynchronous Deep ONNX Objectness Engine (Background Worker Thread):
-   - Fuses deep neural objectness proposals inside the ground arena while keeping the video loop
-     at a locked 60 FPS (< 15 ms frame delay).
+Implements:
+1. Sparse Optical Flow + RANSAC 8-DOF Ground-Homography Bounding-Box Pinning (`_AnomalyTracker.warp_tracks`):
+   - On every single frame (60 FPS), projects all tracked bounding boxes through the 3x3 Lucas-Kanade
+     RANSAC Ground Homography matrix H_{t-1 -> t} via `cv2.perspectiveTransform`.
+   - Even when the drone pitches, rolls, banks, or yaws rapidly, locked boxes move instantaneously
+     with the physical ground!
+2. Homography-Stabilized Temporal Anomaly Evidence Accumulation Grid (S_t on 960x540):
+   - Maintains floating-point ground anomaly confidence maps (S_pos, S_neg, S_col) at 960x540 resolution.
+   - Warps S_{t-1} by the ground Homography H_{960} before fusing with current frame Z-scores:
+       S_t = 0.62 * warpPerspective(S_{t-1}, H_{960}) + 0.38 * Z_t
+   - Random RF noise cancels out to 0 while real tools/objects on the ground accumulate constructively.
+3. 960x540 Ground-Plane Anomaly Grid (9x pixel density of 320x180) + YOLO11m (20.1M params, 960x960, opset=12)
+   running on NVIDIA RTX 4060 CUDAExecutionProvider.
 """
 
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-
-
-YOLO_ONNX_URLS = [
-    "https://huggingface.co/Kalray/yolov8/resolve/main/yolov8s.onnx",
-    "https://huggingface.co/Kalray/yolov8/resolve/main/yolov8n.onnx",
-    "https://huggingface.co/SpotLab/YOLOv8Detection/resolve/3005c6751fb19cdeb6b10c066185908faf66a097/yolov8n.onnx",
-]
 
 
 @dataclass
@@ -49,7 +39,7 @@ class Detection:
 @dataclass
 class _Track:
     track_id: int
-    bbox: np.ndarray
+    bbox: np.ndarray       # float32 [x1, y1, x2, y2]
     confidence: float
     hits: int
     misses: int
@@ -70,18 +60,39 @@ def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
 
 class _AnomalyTracker:
     """
-    Temporal Box Tracker with Hysteresis & Fast Decay:
-    - Confirms after 2 detections (`min_hits=2`)
-    - Retains for `max_age=5` detection cycles (~0.15s) to prevent flicker,
-      and drops immediately when an object leaves the frame.
+    Homography-Pinned Temporal Box Tracker:
+    - Warps active track boxes on every frame using the 8-DOF Lucas-Kanade Ground Homography H_{t-1 -> t}
+      so boxes stay glued to the ground during drone pitch/roll/yaw.
+    - Confirms after 2 detections (`min_hits=2`), retains for `max_age=8` cycles.
     """
 
-    def __init__(self, min_hits: int = 2, max_age: int = 5, ema_alpha: float = 0.45):
+    def __init__(self, min_hits: int = 2, max_age: int = 8, ema_alpha: float = 0.48):
         self.min_hits = min_hits
         self.max_age = max_age
         self.ema_alpha = ema_alpha
         self.next_id = 1
         self.tracks: List[_Track] = []
+
+    def warp_tracks(self, H_full: Optional[np.ndarray], frame_w: int, frame_h: int) -> None:
+        """Projects all active track bounding boxes through the 3x3 Ground Homography H_{t-1 -> t}."""
+        if H_full is None or not self.tracks:
+            return
+        if np.allclose(H_full, np.eye(3, dtype=np.float32), atol=1e-3):
+            return
+
+        for trk in self.tracks:
+            x1, y1, x2, y2 = trk.bbox
+            corners = np.array(
+                [[[x1, y1]], [[x2, y1]], [[x2, y2]], [[x1, y2]]], dtype=np.float32
+            )
+            warped = cv2.perspectiveTransform(corners, H_full)
+            wx = warped[:, 0, 0]
+            wy = warped[:, 0, 1]
+            nx1 = float(np.clip(np.min(wx), 0.0, frame_w - 2.0))
+            ny1 = float(np.clip(np.min(wy), 0.0, frame_h - 2.0))
+            nx2 = float(np.clip(np.max(wx), nx1 + 2.0, frame_w - 1.0))
+            ny2 = float(np.clip(np.max(wy), ny1 + 2.0, frame_h - 1.0))
+            trk.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
     def update(
         self, raw_boxes: List[Tuple[Tuple[int, int, int, int], float]], frame_w: int, frame_h: int
@@ -103,8 +114,8 @@ class _AnomalyTracker:
                 dcx = 0.5 * (db[0] + db[2])
                 dcy = 0.5 * (db[1] + db[3])
                 dist = ((tcx - dcx) ** 2 + (tcy - dcy) ** 2) ** 0.5
-                if iou >= 0.12 or dist <= max(50.0, frame_w * 0.045):
-                    score = iou + max(0.0, 1.0 - dist / 160.0) * 0.5
+                if iou >= 0.12 or dist <= max(55.0, frame_w * 0.05):
+                    score = iou + max(0.0, 1.0 - dist / 180.0) * 0.5
                     if score > best_score:
                         best_score = score
                         best_idx = i
@@ -156,7 +167,7 @@ class _AnomalyTracker:
                         bbox=(x1, y1, x2, y2),
                         center=(cx, cy),
                         offset_from_center=(cx - frame_cx, cy - frame_cy),
-                        color_bgr=(0, 255, 120),
+                        color_bgr=(220, 30, 255),
                     )
                 )
         return confirmed
@@ -165,21 +176,17 @@ class _AnomalyTracker:
 def _build_ground_arena_mask(w: int, h: int) -> np.ndarray:
     """
     Constructs a tight, pixel-accurate Ground Search Arena mask on (w, h):
-    - Masks ONLY the thin left & right foam landing gear tubes + bottom carbon brackets
-      and the small 'PAL HD 720P' OSD text box.
-    - Keeps the entire outer fisheye ground arena (left edge, top-right, bottom-right)
-      OPEN for detection!
+    Masks ONLY the curved left & right foam landing gear tubes + bottom carbon brackets
+    and the small 'PAL HD 720P' OSD box, leaving outer fisheye edges OPEN.
     """
     mask = np.full((h, w), 255, dtype=np.uint8)
 
-    # 1. Minimal 1.5% outer frame border margin (preserves fisheye outer edges!)
     mx, my = max(2, int(w * 0.015)), max(2, int(h * 0.02))
     mask[:my, :] = 0
     mask[h - my :, :] = 0
     mask[:, :mx] = 0
     mask[:, w - mx :] = 0
 
-    # 2. Left Landing Gear Curved Foam Tube + Bottom-Left Carbon Bracket
     left_leg_tube = np.array([
         [int(w * 0.08), h],
         [int(w * 0.21), h],
@@ -191,8 +198,6 @@ def _build_ground_arena_mask(w: int, h: int) -> np.ndarray:
     cv2.fillPoly(mask, [left_leg_tube], 0)
     cv2.rectangle(mask, (0, int(h * 0.85)), (int(w * 0.21), h), 0, -1)
 
-    # 3. Right Landing Gear Curved Foam Tube + Bottom-Right Carbon Bracket
-    # Covers full width of right foam leg while leaving bottom-right jacket area (x=0.75..0.84) OPEN!
     right_leg_tube = np.array([
         [int(w * 0.85), h],
         [int(w * 0.98), h],
@@ -204,7 +209,6 @@ def _build_ground_arena_mask(w: int, h: int) -> np.ndarray:
     cv2.fillPoly(mask, [right_leg_tube], 0)
     cv2.rectangle(mask, (int(w * 0.86), int(h * 0.85)), (w, h), 0, -1)
 
-    # 4. Top-Left OSD Box ('PAL HD 720P') & Top-Left Corner Roof/Sky Clutter
     cv2.rectangle(mask, (int(w * 0.13), int(h * 0.02)), (int(w * 0.31), int(h * 0.16)), 0, -1)
     cv2.fillPoly(mask, [np.array([[0, 0], [int(w * 0.22), 0], [0, int(h * 0.30)]], dtype=np.int32)], 0)
 
@@ -219,10 +223,11 @@ class FPVDetector:
         enable_color_anomaly: bool = True,
         yolo_conf_thresh: float = 0.18,
         yolo_iou_thresh: float = 0.40,
-        yolo_input_size: int = 640,
+        yolo_input_size: int = 960,
         anomaly_z_thresh: float = 3.0,
         detect_every_n: int = 2,
         hold_frames: int = 8,
+        accum_decay: float = 0.58,
     ):
         self.enable_yolo = enable_yolo
         self.enable_shapes = enable_shapes
@@ -232,17 +237,25 @@ class FPVDetector:
         self.yolo_input_size = yolo_input_size
         self.anomaly_z_thresh = anomaly_z_thresh
         self.detect_every_n = max(1, int(detect_every_n))
+        self.accum_decay = float(np.clip(accum_decay, 0.0, 0.85))
         self.frame_counter = 0
 
-        self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.45)
-        # 4x Higher Spatial Resolution Grid (640x360 instead of 320x180) for small tools at 3-4m altitude
-        self.det_w, self.det_h = 640, 360
+        self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.48)
+
+        # Upgrade #4: 960x540 High-Resolution Ground-Plane Grid (9x pixel density of original 320x180)
+        self.det_w, self.det_h = 960, 540
         self.arena_mask_small = _build_ground_arena_mask(self.det_w, self.det_h)
+
+        # Upgrade #2: Homography-Stabilized Temporal Anomaly Evidence Accumulation Maps on 960x540
+        self.accum_pos: Optional[np.ndarray] = None
+        self.accum_neg: Optional[np.ndarray] = None
+        self.accum_col: Optional[np.ndarray] = None
+        self._H_accum_960 = np.eye(3, dtype=np.float32)
 
         self.yolo_session = None
         self.yolo_input_name = None
-        self.yolo_model_hw = (640, 640)
-        self.yolo_status = "High-Res 640x360 Ground-Plane + Deep Objectness"
+        self.yolo_model_hw = (960, 960)
+        self.yolo_status = "960x540 Ground-Grid + Temporal Homography Map"
 
         self._yolo_lock = threading.Lock()
         self._yolo_pending_frame: Optional[np.ndarray] = None
@@ -260,32 +273,31 @@ class FPVDetector:
 
     def _init_yolo_onnx(self) -> None:
         """
-        Loads official Ultralytics YOLO11s (`yolo11s.pt`) exported with `opset=12` (`models/yolo11s.onnx`).
-        Automatically uses NVIDIA CUDAExecutionProvider when the NVIDIA GPU driver is active.
+        Loads official Ultralytics YOLO11m (`yolo11m.onnx` at 960x960, opset=12) on RTX 4060 CUDA.
+        Falls back to yolo11s.onnx / yolov8s.onnx if yolo11m.onnx is not present.
         """
         models_dir = Path(__file__).resolve().parent / "models"
         models_dir.mkdir(parents=True, exist_ok=True)
-        yolo11s_onnx = models_dir / "yolo11s.onnx"
-        yolo11s_pt = models_dir / "yolo11s.pt"
+        yolo11m_onnx = models_dir / "yolo11m.onnx"
+        yolo11m_pt = models_dir / "yolo11m.pt"
 
         active_path = None
-
-        if yolo11s_onnx.exists() and yolo11s_onnx.stat().st_size > 5_000_000:
-            active_path = yolo11s_onnx
-        else:
+        if yolo11m_onnx.exists() and yolo11m_onnx.stat().st_size > 10_000_000:
+            active_path = yolo11m_onnx
+        elif yolo11m_pt.exists():
             try:
                 from ultralytics import YOLO
 
-                print("[FPVDetector] Loading official YOLO11s & exporting to ONNX with opset=12...")
-                model = YOLO(str(yolo11s_pt))
-                exported = model.export(format="onnx", opset=12, imgsz=640)
+                print("[FPVDetector] Exporting official YOLO11m (960x960, opset=12)...")
+                model = YOLO(str(yolo11m_pt))
+                exported = model.export(format="onnx", opset=12, imgsz=960)
                 if exported and Path(exported).exists():
                     active_path = Path(exported)
             except Exception as exc:
-                print(f"[FPVDetector] Note: Ultralytics live export not yet ready ({exc}), checking fallback...")
+                print(f"[FPVDetector] Note: YOLO11m export fallback ({exc})")
 
         if active_path is None:
-            for cand in (models_dir / "yolov8s.onnx", models_dir / "yolov8n.onnx"):
+            for cand in (models_dir / "yolo11s.onnx", models_dir / "yolov8s.onnx", models_dir / "yolov8n.onnx"):
                 if cand.exists() and cand.stat().st_size > 1_000_000:
                     active_path = cand
                     break
@@ -315,7 +327,9 @@ class FPVDetector:
                 if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
                     self.yolo_model_hw = (shape[2], shape[3])
                 active_prov = self.yolo_session.get_providers()[0].replace("ExecutionProvider", "")
-                self.yolo_status = f"640x360 Ground-Plane + {active_path.stem.upper()} ({active_prov} opset=12)"
+                self.yolo_status = (
+                    f"960x540 Homography-Grid + {active_path.stem.upper()}@{self.yolo_model_hw[0]} ({active_prov} opset=12)"
+                )
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
             except Exception:
@@ -329,7 +343,7 @@ class FPVDetector:
                     frame_to_run = self._yolo_pending_frame
                     self._yolo_pending_frame = None
             if frame_to_run is None:
-                time.sleep(0.01)
+                time.sleep(0.008)
                 continue
             boxes = self._detect_yolo_boxes(frame_to_run)
             with self._yolo_lock:
@@ -390,7 +404,7 @@ class FPVDetector:
             ix1, iy1 = int(max(0, bx)), int(max(0, by))
             ix2, iy2 = int(min(w - 1, bx + b_w)), int(min(h - 1, by + b_h))
             area_frac = ((ix2 - ix1) * (iy2 - iy1)) / float(w * h)
-            if area_frac > 0.18 or area_frac < 0.0004:
+            if area_frac > 0.18 or area_frac < 0.0003:
                 continue
             mx = int(((ix1 + ix2) * 0.5) / w * self.det_w)
             my = int(((iy1 + iy2) * 0.5) / h * self.det_h)
@@ -401,16 +415,18 @@ class FPVDetector:
             proposals.append(((ix1, iy1, ix2, iy2), float(max_scores[idx])))
         return proposals
 
-    def _detect_ground_objects(self, frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
+    def _detect_ground_objects(
+        self, frame: np.ndarray, H_960: np.ndarray, single_frame_mode: bool = False
+    ) -> List[Tuple[Tuple[int, int, int, int], float]]:
         """
-        High-Resolution (640x360 — 4x pixel density) Dual-Scale Signed Ground-Plane Anomaly Detector:
-        Catches small tools, pliers, screws, sensors, and outer fisheye targets at 3-4m flight altitude.
+        960x540 High-Resolution Dual-Scale Signed Ground-Plane Anomaly Detector
+        with Homography-Stabilized Temporal Evidence Accumulation (Upgrade #2 & #4).
         """
         h, w = frame.shape[:2]
         det_w, det_h = self.det_w, self.det_h
         sx_factor, sy_factor = w / float(det_w), h / float(det_h)
 
-        # 1. Downscale to 640x360 with INTER_AREA + 5x5 Median-Gaussian pre-filter
+        # 1. Downscale to 960x540 + 5x5 Median-Gaussian pre-filter
         small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
         small_clean = cv2.GaussianBlur(cv2.medianBlur(small, 5), (5, 5), 1.2)
 
@@ -421,17 +437,17 @@ class FPVDetector:
 
         arena_bool = self.arena_mask_small > 0
 
-        # 2. Wide Ground-Plane Illumination Model (catches medium/large objects like boxes/jackets)
-        coarse_L = cv2.resize(L, (10, 6), interpolation=cv2.INTER_AREA)
+        # 2. Wide Ground-Plane Illumination Model (catches medium/large boxes, jackets, containers)
+        coarse_L = cv2.resize(L, (12, 7), interpolation=cv2.INTER_AREA)
         bg_wide = cv2.GaussianBlur(
-            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (51, 51), 16.0
+            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (75, 75), 22.0
         )
         diff_wide = L - bg_wide
         mad_wide = float(np.median(np.abs(diff_wide[arena_bool])) * 1.4826 + 3.5)
         z_wide = diff_wide / mad_wide
 
-        # 3. Local Ground-Plane Illumination Model at 640x360 (catches small tools, pliers, screws, chips)
-        bg_local = cv2.GaussianBlur(L, (41, 41), 12.0)
+        # 3. Local Ground-Plane Illumination Model at 960x540 (catches small tools, pliers, screws, sensors)
+        bg_local = cv2.GaussianBlur(L, (61, 61), 18.0)
         diff_local = L - bg_local
         mad_local = float(np.median(np.abs(diff_local[arena_bool])) * 1.4826 + 3.0)
         z_local = diff_local / mad_local
@@ -440,9 +456,9 @@ class FPVDetector:
         z_pos = np.maximum(0.0, z_signed)
         z_neg = np.maximum(0.0, -z_signed)
 
-        # 4. Chromaticity Outlier Score on 640x360
-        A_smooth = cv2.GaussianBlur(A, (17, 17), 4.5)
-        B_smooth = cv2.GaussianBlur(B, (17, 17), 4.5)
+        # 4. Chromaticity Outlier Score on 960x540
+        A_smooth = cv2.GaussianBlur(A, (21, 21), 5.5)
+        B_smooth = cv2.GaussianBlur(B, (21, 21), 5.5)
         med_A = float(np.median(A_smooth[arena_bool]))
         mad_A = float(np.median(np.abs(A_smooth[arena_bool] - med_A)) * 1.4826 + 3.0)
         med_B = float(np.median(B_smooth[arena_bool]))
@@ -452,18 +468,42 @@ class FPVDetector:
         chroma_mag = np.sqrt((A_smooth - med_A) ** 2 + (B_smooth - med_B) ** 2)
         z_color = np.where(chroma_mag >= 16.0, z_color, 0.0)
 
-        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        # 5. Upgrade #2: Homography-Stabilized Temporal Anomaly Evidence Accumulation
+        if (
+            not single_frame_mode
+            and self.accum_decay > 0.01
+            and self.accum_pos is not None
+            and self.accum_pos.shape == (det_h, det_w)
+        ):
+            w_pos = cv2.warpPerspective(self.accum_pos, H_960, (det_w, det_h), flags=cv2.INTER_LINEAR)
+            w_neg = cv2.warpPerspective(self.accum_neg, H_960, (det_w, det_h), flags=cv2.INTER_LINEAR)
+            w_col = cv2.warpPerspective(self.accum_col, H_960, (det_w, det_h), flags=cv2.INTER_LINEAR)
+            alpha_cur = 1.0 - self.accum_decay
+            self.accum_pos = self.accum_decay * w_pos + alpha_cur * z_pos
+            self.accum_neg = self.accum_decay * w_neg + alpha_cur * z_neg
+            self.accum_col = self.accum_decay * w_col + alpha_cur * z_color
+            # Take max of accumulated world-stabilized score and instant strong score
+            eff_pos = np.maximum(self.accum_pos * 1.15, z_pos * 0.92)
+            eff_neg = np.maximum(self.accum_neg * 1.15, z_neg * 0.92)
+            eff_col = np.maximum(self.accum_col * 1.15, z_color * 0.92)
+        else:
+            self.accum_pos = z_pos.copy()
+            self.accum_neg = z_neg.copy()
+            self.accum_col = z_color.copy()
+            eff_pos, eff_neg, eff_col = z_pos, z_neg, z_color
+
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
         thresh = self.anomaly_z_thresh
 
-        mask_pos = cv2.morphologyEx(((z_pos >= thresh + 0.5) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
-        mask_neg = cv2.morphologyEx(((z_neg >= thresh) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
-        mask_col = cv2.morphologyEx(((z_color >= thresh + 0.4) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
+        mask_pos = cv2.morphologyEx(((eff_pos >= thresh + 0.5) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
+        mask_neg = cv2.morphologyEx(((eff_neg >= thresh) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
+        mask_col = cv2.morphologyEx(((eff_col >= thresh + 0.4) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
 
-        fused_z = np.maximum(np.maximum(z_pos, z_neg), z_color * 0.90)
+        fused_z = np.maximum(np.maximum(eff_pos, eff_neg), eff_col * 0.90)
         proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
-        # On 640x360 (4x area of 320x180), min_area=40 catches tiny screws/pliers (~10px on 320x180)
-        min_area = 40.0
+        # On 960x540 (9x area of 320x180), min_area=85 catches tiny tools/screws (~9.5px on 320x180)
+        min_area = 85.0
         max_area = (det_w * det_h) * 0.15
 
         for ch_idx, mask_channel in enumerate((mask_pos, mask_neg, mask_col)):
@@ -482,8 +522,8 @@ class FPVDetector:
                 if (area / hull_area) < 0.48:
                     continue
 
-                rx1, ry1 = max(0, sx - 10), max(0, sy - 10)
-                rx2, ry2 = min(det_w, sx + sbw + 10), min(det_h, sy + sbh + 10)
+                rx1, ry1 = max(0, sx - 14), max(0, sy - 14)
+                rx2, ry2 = min(det_w, sx + sbw + 14), min(det_h, sy + sbh + 14)
                 roi_L = L[ry1:ry2, rx1:rx2]
 
                 box_region = np.zeros((ry2 - ry1, rx2 - rx1), dtype=bool)
@@ -531,22 +571,45 @@ class FPVDetector:
             return []
         return [proposals[i] for i in np.array(idxs).flatten()]
 
+    @staticmethod
+    def _scale_homography(H_320: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+        sx, sy = target_w / 320.0, target_h / 180.0
+        S = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        S_inv = np.array([[1.0 / sx, 0.0, 0.0], [0.0, 1.0 / sy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        return S @ H_320 @ S_inv
+
     def detect_and_annotate(
         self,
         frame: np.ndarray,
         draw_hud: bool = True,
-        perf_stats: Optional[Dict[str, float]] = None,
+        perf_stats: Optional[Dict[str, Any]] = None,
         single_frame_mode: bool = False,
     ) -> Tuple[np.ndarray, List[Detection], Dict[str, float]]:
         t0 = time.perf_counter()
         h, w = frame.shape[:2]
         self.frame_counter += 1
 
+        # Extract 3x3 Lucas-Kanade Ground Homography from enhancer metrics (if provided)
+        H_320 = np.eye(3, dtype=np.float32)
+        if perf_stats and "homography_320" in perf_stats and perf_stats["homography_320"] is not None:
+            H_320 = perf_stats["homography_320"]
+
+        # 1. Upgrade #1: Warp all active tracked bounding boxes with current frame's Ground Homography
+        H_full = self._scale_homography(H_320, w, h)
+        self.tracker.warp_tracks(H_full, w, h)
+
+        # Accumulate inter-frame 960x540 Homography for the Temporal Anomaly Grid
+        H_960_step = self._scale_homography(H_320, self.det_w, self.det_h)
+        self._H_accum_960 = H_960_step @ self._H_accum_960
+
         if single_frame_mode or self.frame_counter % self.detect_every_n == 1 or self.detect_every_n == 1:
             raw_proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
             if self.enable_color_anomaly:
-                raw_proposals.extend(self._detect_ground_objects(frame))
+                raw_proposals.extend(
+                    self._detect_ground_objects(frame, self._H_accum_960, single_frame_mode=single_frame_mode)
+                )
+            self._H_accum_960 = np.eye(3, dtype=np.float32)
 
             if self.enable_yolo and self.yolo_session is not None:
                 if single_frame_mode:
@@ -555,7 +618,6 @@ class FPVDetector:
                 else:
                     with self._yolo_lock:
                         if self._yolo_pending_frame is None:
-                            # Pass sharp 960x540 linear-sampled frame to YOLO11s for higher small-object recall
                             self._yolo_pending_frame = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
                         for (bx1, by1, bx2, by2), sc in self._latest_yolo_boxes:
                             sx, sy = w / 960.0, h / 540.0
@@ -565,7 +627,6 @@ class FPVDetector:
 
             merged = self._merge_proposals_nms(raw_proposals)
             if single_frame_mode:
-                # Confirm immediately in single-image test mode
                 self.tracker.min_hits = 1
             detections = self.tracker.update(merged, w, h)
         else:
@@ -575,7 +636,6 @@ class FPVDetector:
         annotated = frame
         cx, cy = w // 2, h // 2
 
-        # Center boresight crosshair
         cv2.line(annotated, (cx - 18, cy), (cx - 5, cy), (180, 255, 180), 1, cv2.LINE_AA)
         cv2.line(annotated, (cx + 5, cy), (cx + 18, cy), (180, 255, 180), 1, cv2.LINE_AA)
         cv2.line(annotated, (cx, cy - 18), (cx, cy - 5), (180, 255, 180), 1, cv2.LINE_AA)
@@ -584,16 +644,13 @@ class FPVDetector:
         for det in detections:
             x1, y1, x2, y2 = det.bbox
             tcx, tcy = det.center
-            # High-contrast Neon Magenta (rare in natural terrain/rocks/moss) + Black Halo
             box_color = (220, 30, 255)
 
-            # Black contrast halo + Vivid Neon Magenta box (pops on white glare, dark shadows, moss, and Martian sand)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 0), 5)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
             cv2.circle(annotated, (tcx, tcy), 5, (0, 0, 0), -1, cv2.LINE_AA)
             cv2.circle(annotated, (tcx, tcy), 3, (0, 255, 255), -1, cv2.LINE_AA)
 
-            # Solid dark pill behind label text so it is always 100% readable
             (tw, th), _ = cv2.getTextSize(det.label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             ly = max(th + 42, y1 - 6)
             cv2.rectangle(annotated, (x1, ly - th - 6), (x1 + tw + 10, ly + 4), (12, 12, 16), -1)
@@ -619,17 +676,17 @@ class FPVDetector:
         canvas: np.ndarray,
         detections: List[Detection],
         detect_ms: float,
-        perf_stats: Dict[str, float],
+        perf_stats: Dict[str, Any],
     ) -> None:
         h, w = canvas.shape[:2]
         top_strip = canvas[:34, :]
         dark_bar = np.full_like(top_strip, (12, 16, 22))
         cv2.addWeighted(dark_bar, 0.72, top_strip, 0.28, 0, top_strip)
 
-        fps = perf_stats.get("fps", 0.0)
-        enh_ms = perf_stats.get("enhance_ms", 0.0)
-        e2e_ms = perf_stats.get("e2e_delay_ms", enh_ms + detect_ms)
-        mode_str = perf_stats.get("enhancer_mode", "CNN+RNN").upper()
+        fps = float(perf_stats.get("fps", 0.0))
+        enh_ms = float(perf_stats.get("enhance_ms", 0.0))
+        e2e_ms = float(perf_stats.get("e2e_delay_ms", enh_ms + detect_ms))
+        mode_str = str(perf_stats.get("enhancer_mode", "CNN+RNN")).upper()
 
         hud_left = (
             f"FPV-ML [{mode_str}] {w}x{h} | {fps:4.1f} FPS | "
@@ -647,7 +704,7 @@ class FPVDetector:
             (max(12, w - rw - 12), 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
-            (0, 255, 140),
+            (220, 30, 255),
             1,
             cv2.LINE_AA,
         )

@@ -198,7 +198,7 @@ def main() -> int:
     sample_saved = False
 
     if show_preview:
-        win_name = f"FPV ML Pipeline ({out_w}x{out_h}) [e=Mode y=YOLO c=Detect v=Split q=Quit]"
+        win_name = f"FPV ML Pipeline ({out_w}x{out_h}) [e=Mode f=Defish y=YOLO c=Detect v=Split q=Quit]"
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win_name, min(out_w, 1600), min(out_h, 900))
 
@@ -212,15 +212,16 @@ def main() -> int:
 
             t_proc_start = time.perf_counter()
 
-            # Stage 1: Crisp Neural Detail/Super-Resolution + Mild Temporal RNN
+            # Stage 1: Fisheye Defish + LK-Homography MFSR + Ground-Mute / Object-Pop Super-Resolution
             enhanced_frame, enh_metrics = enhancer.enhance(raw_frame)
 
-            # Stage 2: Martian-Terrain Foreign-Object / Anomaly Detection
+            # Stage 2: 960x540 Homography-Stabilized Ground Anomaly Grid + YOLO11m@960 (RTX 4060 CUDA)
             perf_stats = {
                 "fps": fps_ema,
                 "enhance_ms": enh_metrics["enhance_ms"],
                 "e2e_delay_ms": e2e_delay_ema,
                 "enhancer_mode": enhancer.mode,
+                "homography_320": enh_metrics.get("homography_320"),
             }
             annotated_frame, detections, det_metrics = detector.detect_and_annotate(
                 enhanced_frame, draw_hud=True, perf_stats=perf_stats
@@ -253,6 +254,9 @@ def main() -> int:
                 elif key == ord("e"):
                     modes = ["cnn_rnn", "fast_hybrid", "passthrough"]
                     enhancer.mode = modes[(modes.index(enhancer.mode) + 1) % len(modes)]
+                elif key == ord("f"):
+                    enhancer.enable_defish = not enhancer.enable_defish
+                    enhancer.reset_state()
                 elif key == ord("y"):
                     detector.enable_yolo = not detector.enable_yolo
                 elif key == ord("c"):

@@ -13,6 +13,7 @@ models/yolov8n.onnx
 models/yolov8s.onnx
 models/yolo11n.onnx
 models/yolo11s.onnx
+models/yolo11m.onnx
 *.pt
 *.mp4
 *.avi
