@@ -235,13 +235,14 @@ class FPVDetector:
         self.frame_counter = 0
 
         self.tracker = _AnomalyTracker(min_hits=2, max_age=hold_frames, ema_alpha=0.45)
-        self.det_w, self.det_h = 320, 180
+        # 4x Higher Spatial Resolution Grid (640x360 instead of 320x180) for small tools at 3-4m altitude
+        self.det_w, self.det_h = 640, 360
         self.arena_mask_small = _build_ground_arena_mask(self.det_w, self.det_h)
 
         self.yolo_session = None
         self.yolo_input_name = None
         self.yolo_model_hw = (640, 640)
-        self.yolo_status = "Multi-Scale Ground-Plane + Deep Objectness"
+        self.yolo_status = "High-Res 640x360 Ground-Plane + Deep Objectness"
 
         self._yolo_lock = threading.Lock()
         self._yolo_pending_frame: Optional[np.ndarray] = None
@@ -260,8 +261,7 @@ class FPVDetector:
     def _init_yolo_onnx(self) -> None:
         """
         Loads official Ultralytics YOLO11s (`yolo11s.pt`) exported with `opset=12` (`models/yolo11s.onnx`).
-        Using official Ultralytics `opset=12` export eliminates FPN Resize/Upsample coordinate drift
-        and third-party ONNX export accuracy loss.
+        Automatically uses NVIDIA CUDAExecutionProvider when the NVIDIA GPU driver is active.
         """
         models_dir = Path(__file__).resolve().parent / "models"
         models_dir.mkdir(parents=True, exist_ok=True)
@@ -270,11 +270,9 @@ class FPVDetector:
 
         active_path = None
 
-        # 1. If official opset=12 yolo11s.onnx is already exported, use it directly
         if yolo11s_onnx.exists() and yolo11s_onnx.stat().st_size > 5_000_000:
             active_path = yolo11s_onnx
         else:
-            # Export yolo11s.pt -> yolo11s.onnx with explicit opset=12 via official Ultralytics exporter
             try:
                 from ultralytics import YOLO
 
@@ -286,7 +284,6 @@ class FPVDetector:
             except Exception as exc:
                 print(f"[FPVDetector] Note: Ultralytics live export not yet ready ({exc}), checking fallback...")
 
-        # Fallback to yolov8s.onnx / yolov8n.onnx only if yolo11s is not yet exported
         if active_path is None:
             for cand in (models_dir / "yolov8s.onnx", models_dir / "yolov8n.onnx"):
                 if cand.exists() and cand.stat().st_size > 1_000_000:
@@ -312,7 +309,8 @@ class FPVDetector:
                 shape = inp_meta.shape
                 if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
                     self.yolo_model_hw = (shape[2], shape[3])
-                self.yolo_status = f"Ground-Plane + {active_path.stem.upper()} (opset=12 Async)"
+                prov_short = providers[0].replace("ExecutionProvider", "")
+                self.yolo_status = f"640x360 Ground-Plane + {active_path.stem.upper()} ({prov_short} opset=12)"
                 self._yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
                 self._yolo_thread.start()
             except Exception:
@@ -387,9 +385,8 @@ class FPVDetector:
             ix1, iy1 = int(max(0, bx)), int(max(0, by))
             ix2, iy2 = int(min(w - 1, bx + b_w)), int(min(h - 1, by + b_h))
             area_frac = ((ix2 - ix1) * (iy2 - iy1)) / float(w * h)
-            if area_frac > 0.18 or area_frac < 0.0005:
+            if area_frac > 0.18 or area_frac < 0.0004:
                 continue
-            # Check that box center falls inside the active Ground Search Arena
             mx = int(((ix1 + ix2) * 0.5) / w * self.det_w)
             my = int(((iy1 + iy2) * 0.5) / h * self.det_h)
             mx = max(0, min(self.det_w - 1, mx))
@@ -401,20 +398,16 @@ class FPVDetector:
 
     def _detect_ground_objects(self, frame: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], float]]:
         """
-        Dual-Scale Signed Ground-Plane Object & Anomaly Detector:
-        - Combines a Wide Ground-Plane Model (for medium/large objects like boxes/containers)
-          and a Local Ground-Plane Model (for small tools, screws, sensors, chips), each normalized
-          by its own Robust Median Absolute Deviation (MAD).
-        - Thresholds positive (bright-on-ground) and negative (dark-on-ground) channels separately
-          after spatial smoothing so zero-mean bipolar floor noise cancels out completely.
+        High-Resolution (640x360 — 4x pixel density) Dual-Scale Signed Ground-Plane Anomaly Detector:
+        Catches small tools, pliers, screws, sensors, and outer fisheye targets at 3-4m flight altitude.
         """
         h, w = frame.shape[:2]
         det_w, det_h = self.det_w, self.det_h
         sx_factor, sy_factor = w / float(det_w), h / float(det_h)
 
-        # 1. Downscale with INTER_AREA + 5x5 Median-Gaussian pre-filter to erase bipolar analog floor grain
+        # 1. Downscale to 640x360 with INTER_AREA + 5x5 Median-Gaussian pre-filter
         small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
-        small_clean = cv2.GaussianBlur(cv2.medianBlur(small, 5), (5, 5), 1.1)
+        small_clean = cv2.GaussianBlur(cv2.medianBlur(small, 5), (5, 5), 1.2)
 
         lab = cv2.cvtColor(small_clean, cv2.COLOR_BGR2LAB).astype(np.float32)
         L = lab[:, :, 0]
@@ -423,29 +416,28 @@ class FPVDetector:
 
         arena_bool = self.arena_mask_small > 0
 
-        # 2. Wide Ground-Plane Illumination Model (catches medium/large objects like the white box)
-        coarse_L = cv2.resize(L, (8, 5), interpolation=cv2.INTER_AREA)
+        # 2. Wide Ground-Plane Illumination Model (catches medium/large objects like boxes/jackets)
+        coarse_L = cv2.resize(L, (10, 6), interpolation=cv2.INTER_AREA)
         bg_wide = cv2.GaussianBlur(
-            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (31, 31), 10.0
+            cv2.resize(coarse_L, (det_w, det_h), interpolation=cv2.INTER_CUBIC), (51, 51), 16.0
         )
         diff_wide = L - bg_wide
         mad_wide = float(np.median(np.abs(diff_wide[arena_bool])) * 1.4826 + 3.5)
         z_wide = diff_wide / mad_wide
 
-        # 3. Local Ground-Plane Illumination Model (catches small objects like screws, pliers, chips, sensors)
-        bg_local = cv2.GaussianBlur(L, (25, 25), 7.0)
+        # 3. Local Ground-Plane Illumination Model at 640x360 (catches small tools, pliers, screws, chips)
+        bg_local = cv2.GaussianBlur(L, (41, 41), 12.0)
         diff_local = L - bg_local
         mad_local = float(np.median(np.abs(diff_local[arena_bool])) * 1.4826 + 3.0)
         z_local = diff_local / mad_local
 
-        # Signed dual-scale Z-score (preserves + for bright objects and - for dark objects)
         z_signed = np.where(np.abs(z_local) >= np.abs(z_wide), z_local, z_wide)
         z_pos = np.maximum(0.0, z_signed)
         z_neg = np.maximum(0.0, -z_signed)
 
-        # 4. Chromaticity Outlier Score (wide 11x11 smoothing kills PAL rainbow blotches)
-        A_smooth = cv2.GaussianBlur(A, (11, 11), 3.0)
-        B_smooth = cv2.GaussianBlur(B, (11, 11), 3.0)
+        # 4. Chromaticity Outlier Score on 640x360
+        A_smooth = cv2.GaussianBlur(A, (17, 17), 4.5)
+        B_smooth = cv2.GaussianBlur(B, (17, 17), 4.5)
         med_A = float(np.median(A_smooth[arena_bool]))
         mad_A = float(np.median(np.abs(A_smooth[arena_bool] - med_A)) * 1.4826 + 3.0)
         med_B = float(np.median(B_smooth[arena_bool]))
@@ -455,8 +447,7 @@ class FPVDetector:
         chroma_mag = np.sqrt((A_smooth - med_A) ** 2 + (B_smooth - med_B) ** 2)
         z_color = np.where(chroma_mag >= 16.0, z_color, 0.0)
 
-        # Threshold Bright, Dark, and Color masks SEPARATELY so '+' and '-' floor grain never merge!
-        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         thresh = self.anomaly_z_thresh
 
         mask_pos = cv2.morphologyEx(((z_pos >= thresh + 0.5) & arena_bool).astype(np.uint8) * 255, cv2.MORPH_CLOSE, k_close)
@@ -466,7 +457,8 @@ class FPVDetector:
         fused_z = np.maximum(np.maximum(z_pos, z_neg), z_color * 0.90)
         proposals: List[Tuple[Tuple[int, int, int, int], float]] = []
 
-        min_area = 14.0
+        # On 640x360 (4x area of 320x180), min_area=40 catches tiny screws/pliers (~10px on 320x180)
+        min_area = 40.0
         max_area = (det_w * det_h) * 0.15
 
         for ch_idx, mask_channel in enumerate((mask_pos, mask_neg, mask_col)):
@@ -478,15 +470,15 @@ class FPVDetector:
 
                 sx, sy, sbw, sbh = cv2.boundingRect(cnt)
                 aspect = sbw / float(max(sbh, 1))
-                if aspect > 4.2 or aspect < 0.24:
+                if aspect > 4.4 or aspect < 0.22:
                     continue
 
                 hull_area = max(1.0, cv2.contourArea(cv2.convexHull(cnt)))
-                if (area / hull_area) < 0.50:
+                if (area / hull_area) < 0.48:
                     continue
 
-                rx1, ry1 = max(0, sx - 6), max(0, sy - 6)
-                rx2, ry2 = min(det_w, sx + sbw + 6), min(det_h, sy + sbh + 6)
+                rx1, ry1 = max(0, sx - 10), max(0, sy - 10)
+                rx2, ry2 = min(det_w, sx + sbw + 10), min(det_h, sy + sbh + 10)
                 roi_L = L[ry1:ry2, rx1:rx2]
 
                 box_region = np.zeros((ry2 - ry1, rx2 - rx1), dtype=bool)
@@ -500,16 +492,15 @@ class FPVDetector:
                 roi_C = chroma_mag[ry1:ry2, rx1:rx2]
                 box_dC = float(np.mean(roi_C[box_region]))
 
-                # Bright patches need higher contrast (27.0) to ignore sunlit concrete; dark objects/tools need 20.0; color needs 16.0
                 if ch_idx == 0 and box_dL < 27.0:
                     continue
-                elif ch_idx == 1 and box_dL < 20.0:
+                elif ch_idx == 1 and box_dL < 19.5:
                     continue
                 elif ch_idx == 2 and box_dC < 26.0:
                     continue
 
                 peak_z = float(np.max(fused_z[sy : sy + sbh, sx : sx + sbw]))
-                if peak_z < 4.0:
+                if peak_z < 3.9:
                     continue
 
                 conf = float(np.clip((box_dL + box_dC * 1.5) / 50.0, 0.55, 0.99))
@@ -528,7 +519,6 @@ class FPVDetector:
         if len(proposals) <= 1:
             return proposals
 
-        # Strict overlap-only merge (never chain separate distant boxes into one giant box)
         boxes = [[x1, y1, x2 - x1, y2 - y1] for (x1, y1, x2, y2), _ in proposals]
         scores = [c for _, c in proposals]
         idxs = cv2.dnn.NMSBoxes(boxes, scores, 0.25, 0.35)
@@ -560,9 +550,10 @@ class FPVDetector:
                 else:
                     with self._yolo_lock:
                         if self._yolo_pending_frame is None:
-                            self._yolo_pending_frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_NEAREST)
+                            # Pass sharp 960x540 linear-sampled frame to YOLO11s for higher small-object recall
+                            self._yolo_pending_frame = cv2.resize(frame, (960, 540), interpolation=cv2.INTER_LINEAR)
                         for (bx1, by1, bx2, by2), sc in self._latest_yolo_boxes:
-                            sx, sy = w / 640.0, h / 360.0
+                            sx, sy = w / 960.0, h / 540.0
                             raw_proposals.append(
                                 ((int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy)), sc)
                             )
